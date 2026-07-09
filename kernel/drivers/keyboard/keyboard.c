@@ -17,9 +17,16 @@ static const char scancode_set1[128] = {
 static volatile char last_char = 0;
 static int e0_prefix = 0;
 static int alt_pressed = 0;
+static int ctrl_pressed = 0;
 
 #define KEY_UP    0x01
 #define KEY_DOWN  0x02
+#define KEY_LEFT  0x03
+#define KEY_RIGHT 0x04
+#define KEY_HOME  0x05
+#define KEY_END   0x06
+#define KEY_PGUP  0x07
+#define KEY_PGDN  0x08
 
 char keyboard_last_char(void)
 {
@@ -39,14 +46,24 @@ void keyboard_handler(void)
 
     if (e0_prefix) {
         e0_prefix = 0;
+        if (sc == 0x1D) { ctrl_pressed = 1; return; }
+        if (sc == 0x9D) { ctrl_pressed = 0; return; }
         if (sc == 0x38) { alt_pressed = 1; return; }
         if (sc == 0xB8) { alt_pressed = 0; return; }
         if (sc & 0x80) return;
         if (sc == 0x48) { last_char = KEY_UP; return; }
         if (sc == 0x50) { last_char = KEY_DOWN; return; }
+        if (sc == 0x4B) { last_char = KEY_LEFT; return; }
+        if (sc == 0x4D) { last_char = KEY_RIGHT; return; }
+        if (sc == 0x47) { last_char = KEY_HOME; return; }
+        if (sc == 0x4F) { last_char = KEY_END; return; }
+        if (sc == 0x49) { last_char = KEY_PGUP; return; }
+        if (sc == 0x51) { last_char = KEY_PGDN; return; }
         return;
     }
 
+    if (sc == 0x1D) { ctrl_pressed = 1; return; }
+    if (sc == 0x9D) { ctrl_pressed = 0; return; }
     if (sc == 0x38) { alt_pressed = 1; return; }
     if (sc == 0xB8) { alt_pressed = 0; return; }
     if (sc & 0x80) return;
@@ -69,6 +86,11 @@ static void ps2_wait_read(void)
     for (int i = 0; i < 10000; i++) {
         if (inb(PS2_STAT) & 1) return;
     }
+}
+
+int is_ctrl_pressed(void)
+{
+    return ctrl_pressed;
 }
 
 int is_alt_pressed(void)

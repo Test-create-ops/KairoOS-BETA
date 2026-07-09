@@ -1,7 +1,7 @@
 #include "heap.h"
 #include "paging.h"
 
-#define HEAP_PHYS_START 0x180000
+#define HEAP_PHYS_START 0x190000
 #define HEAP_INITIAL_SIZE (1024 * 1024)
 
 typedef struct block_header {

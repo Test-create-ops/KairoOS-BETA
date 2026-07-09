@@ -13,6 +13,7 @@ typedef struct {
 
 void gfx_init(fb_info_t *info);
 void gfx_putpixel(int x, int y, uint32_t color);
+uint32_t gfx_getpixel(int x, int y);
 void gfx_clear(uint32_t color);
 void gfx_rect(int x, int y, int w, int h, uint32_t color);
 void gfx_fillrect(int x, int y, int w, int h, uint32_t color);

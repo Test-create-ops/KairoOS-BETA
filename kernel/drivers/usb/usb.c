@@ -89,10 +89,13 @@ struct uhci_qh {
 #define TD_ACTLEN_MASK   0x7FF
 
 // Link pointer types
+// Bit 0 = Terminate (1 = end of list)
+// Bit 1 = Type (0 = TD, 1 = QH)
+// Bit 2 = Depth/Breadth (for TD links only)
 #define LINK_TERM   0x0001
 #define LINK_QH     0x0002
-#define LINK_TD     0x0003
-#define LINK_DEPTH  0x0004
+#define LINK_TD     0x0000  // No flags — not terminated, next is TD
+// For TD link: address must have bits 2:0 = 0
 
 // ─── Static Data ───
 
@@ -111,6 +114,9 @@ static struct uhci_td td_pool[MAX_TDS] __attribute__((aligned(16)));
 
 // Data buffers for TDs
 
+// Forward declarations
+static int uhci_control_transfer(uint8_t dev_addr, uint8_t *setup_pkt, uint8_t *data_buf, int data_len, int is_in);
+
 // Device info
 static int device_count = 0;
 static char device_names[MAX_USB_DEVICES][32];
@@ -119,6 +125,11 @@ static uint16_t device_pid[MAX_USB_DEVICES];
 static int device_class[MAX_USB_DEVICES];
 static int device_subclass[MAX_USB_DEVICES];
 static int device_ports[MAX_USB_DEVICES];
+static uint8_t device_addr[MAX_USB_DEVICES];
+
+// HID tablet state
+static int hid_tablet_idx = -1;
+static uint8_t hid_report_buf[16];
 
 // USB device descriptor (18 bytes)
 struct usb_device_descriptor {
@@ -373,6 +384,12 @@ static int uhci_enumerate(int port) {
     device_class[idx] = dd.bDeviceClass;
     device_subclass[idx] = dd.bDeviceSubClass;
     device_ports[idx] = port;
+    device_addr[idx] = 1;
+
+    // Detect QEMU usb-tablet (VID 0x0627, PID 0x0001)
+    if (dd.idVendor == 0x0627 && dd.idProduct == 0x0001) {
+        hid_tablet_idx = idx;
+    }
 
     // Build human-readable name
     char *name = device_names[idx];
@@ -495,6 +512,16 @@ const char* usb_device_name(int index) {
     return device_names[index];
 }
 
+int usb_device_vid(int index) {
+    if (index < 0 || index >= device_count) return 0;
+    return device_vid[index];
+}
+
+int usb_device_pid(int index) {
+    if (index < 0 || index >= device_count) return 0;
+    return device_pid[index];
+}
+
 int usb_poll(void) {
     if (!usb_initialized) return 0;
 
@@ -508,4 +535,32 @@ int usb_poll(void) {
         }
     }
     return 0;
+}
+
+// ─── USB HID Tablet Poll ───
+
+int usb_hid_read(int *x, int *y, int *btn)
+{
+    if (hid_tablet_idx < 0) return 0;
+    if (!usb_initialized) return 0;
+
+    uint8_t dev = device_addr[hid_tablet_idx];
+
+    // GET_REPORT (Input) setup packet
+    uint8_t setup[8] = {
+        0xA1, 0x01,  // bmRequestType, bRequest
+        0x00, 0x01,  // wValue: Report ID=0, Report Type=Input
+        0x00, 0x00,  // wIndex: Interface 0
+        0x10, 0x00   // wLength: 16 bytes
+    };
+
+    int ret = uhci_control_transfer(dev, setup, hid_report_buf, 16, 1);
+    if (ret < 0) return 0;
+
+    // QEMU usb-tablet: byte0=buttons, byte1-2=X (le16), byte3-4=Y (le16)
+    *btn = hid_report_buf[0] & 0x07;
+    *x = hid_report_buf[1] | ((int)hid_report_buf[2] << 8);
+    *y = hid_report_buf[3] | ((int)hid_report_buf[4] << 8);
+
+    return 1;
 }

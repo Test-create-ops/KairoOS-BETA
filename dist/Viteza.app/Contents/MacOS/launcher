@@ -1,0 +1,50 @@
+#!/bin/bash
+# Viteza.app — Self-contained launcher
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+
+osascript -e 'display dialog "Viteza OS si sta avviando...
+QEMU + Ollama verranno installati automaticamente se necessari.
+
+Primo avvio: ~2-5 min (download modelli AI)
+Avvi successivi: ~10 secondi" buttons {"Avvia"} default button 1 with title "Viteza OS"'
+
+if ! command -v qemu-system-x86_64 &>/dev/null; then
+    if ! command -v brew &>/dev/null; then
+        osascript -e 'display dialog "Installazione Homebrew..." buttons {} default button 1 with title "Viteza OS" giving up after 1'
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+    osascript -e 'display dialog "Installazione QEMU..." buttons {} default button 1 with title "Viteza OS" giving up after 1'
+    brew install qemu
+fi
+
+if ! command -v ollama &>/dev/null; then
+    osascript -e 'display dialog "Installazione Ollama..." buttons {} default button 1 with title "Viteza OS" giving up after 1'
+    if ! command -v brew &>/dev/null; then
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+    brew install ollama
+fi
+
+# Check if model is pulled
+if ! ollama list 2>/dev/null | grep -q "llama3.2"; then
+    osascript -e 'display dialog "Download modello AI ~2GB (solo prima volta)..." buttons {} default button 1 with title "Viteza OS" giving up after 1'
+    ollama pull llama3.2 2>&1 | tail -1
+fi
+
+# Ollama server
+ollama serve 2>/dev/null &
+sleep 2
+
+# Proxy seriale (kernel ↔ Ollama)
+python3 "$RES/social_proxy.py" &
+PROXY_PID=$!
+sleep 2
+
+# QEMU (boot rapido via -kernel)
+qemu-system-x86_64 -kernel "$RES/kernel.bin" -m 256 -vga std \
+    -machine pc,accel=tcg -cpu qemu64 \
+    -audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0 \
+    -serial tcp:localhost:9000,server,nowait \
+    -display cocoa
+
+kill $PROXY_PID 2>/dev/null

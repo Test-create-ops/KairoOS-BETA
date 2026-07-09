@@ -23,6 +23,18 @@ unsigned int pci_read32(unsigned char bus, unsigned char slot, unsigned char fun
     return inl(0xCFC);
 }
 
+void pci_write32(unsigned char bus, unsigned char slot, unsigned char func, unsigned char offset, unsigned int value) {
+    unsigned int address =
+        (1 << 31) |
+        (bus << 16) |
+        (slot << 11) |
+        (func << 8) |
+        (offset & 0xFC);
+
+    outl(0xCF8, address);
+    outl(0xCFC, value);
+}
+
 void pci_scan() {
     for (int bus = 0; bus < 256; bus++) {
         for (int slot = 0; slot < 32; slot++) {

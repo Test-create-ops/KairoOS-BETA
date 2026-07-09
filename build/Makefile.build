@@ -1,8 +1,8 @@
-CC = gcc
-LD = ld
+CC = x86_64-elf-gcc
+LD = x86_64-elf-ld
 AS = nasm
 
-CFLAGS = -m64 -ffreestanding -O2 -Wall -Wextra -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mno-sse -mno-sse2
+CFLAGS = -m64 -ffreestanding -O2 -Wall -Wextra -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mno-sse -mno-sse2 -Wa,-noexecstack
 ASFLAGS = -f elf64
 LDFLAGS = -m elf_x86_64 -T build/linker.ld -nostdlib
 
@@ -14,7 +14,7 @@ ASM_OBJS = kernel/asm/boot_entry.o \
            kernel/asm/idt_flush.o \
            kernel/asm/context_switch.o \
            kernel/asm/usermode_trampoline.o \
-           kernel/asm/irq1_keyboard_stub.o
+            kernel/asm/irq1_keyboard_stub.o
 
 OBJS = $(C_OBJS) $(ASM_OBJS)
 

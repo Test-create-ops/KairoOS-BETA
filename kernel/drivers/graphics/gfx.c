@@ -20,6 +20,14 @@ void gfx_drawtext(int x, int y, uint32_t color, const char *text)
 int gfx_width(void) { return (int)fb.width; }
 int gfx_height(void) { return (int)fb.height; }
 
+uint32_t gfx_getpixel(int x, int y)
+{
+    if (x < 0 || y < 0 || x >= (int)fb.width || y >= (int)fb.height)
+        return 0;
+    uint32_t *pixel = (uint32_t *)((uint8_t*)fb.framebuffer + y * fb.pitch + x * 4);
+    return *pixel;
+}
+
 void gfx_putpixel(int x, int y, uint32_t color)
 {
     if (x < 0 || y < 0 || x >= (int)fb.width || y >= (int)fb.height)

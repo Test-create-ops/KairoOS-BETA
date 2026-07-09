@@ -1,7 +1,10 @@
 #ifndef BT_H
 #define BT_H
 
-void bt_hw_init(void);
-void bt_hw_send(const char *msg);
+int  bt_init(void);
+int  bt_is_present(void);
+const char* bt_get_name(void);
+int  bt_get_vendor(void);
+int  bt_get_product(void);
 
 #endif
