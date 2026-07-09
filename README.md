@@ -23,7 +23,7 @@ To use KairoOS:
 
 1. what is the IDE and computer you developed the OS on?
 
-This OS was made in **Visual Studio Code** with 500+ files.
+This OS was made in **Visual Studio Code** with 300+ files.
 i first started making the os in Windows, the i switched to a Mac
 
 End.
