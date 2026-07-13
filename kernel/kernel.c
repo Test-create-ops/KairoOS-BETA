@@ -21,6 +21,8 @@
 #include "scheduler/process.c"
 #include "usermode/usermode.c"
 #include "boot_screen.c"
+#include "launch_pad.c"
+
 
 
 
@@ -63,19 +65,33 @@ static int cmos_read(int reg) {
 }
 
 static void rtc_read(int *h, int *m) {
-    while (cmos_read(0x0A) & 0x80); // wait for RTC update
+    while (cmos_read(0x0A) & 0x80);
     int regb = cmos_read(0x0B);
-    int bin = regb & 4;  // bit 2 = binary mode
-    int vh = cmos_read(0x04), vm = cmos_read(0x02);
+    int bin = regb & 4;
+    int raw = cmos_read(0x04);
+    int vm = cmos_read(0x02);
     if (!(regb & 2)) {
-        // 12-hour mode: convert to 24-hour
-        int pm = vh & 0x80;
-        vh &= 0x7F;
-        if (pm) { vh = (vh % 12) + 12; }
-        else if (vh == 12) { vh = 0; } // 12 AM = 0
+        // 12-hour mode: strip PM bit, convert BCD→decimal, then to 24h
+        int pm = raw & 0x80;
+        raw &= 0x7F;
+        int vh = bin ? raw : (((raw>>4)&0xF)*10 + (raw&0x0F));
+        if (pm) { if (vh != 12) vh += 12; }
+        else { if (vh == 12) vh = 0; }
+        *h = vh;
+    } else {
+        // 24-hour mode: just convert BCD→decimal if needed
+        *h = bin ? raw : (((raw>>4)&0xF)*10 + (raw&0x0F));
     }
-    if (bin) { *h = vh; *m = vm; }
-    else { *h = ((vh>>4)*10)+(vh&0x0F); *m = ((vm>>4)*10)+(vm&0x0F); }
+    *m = bin ? vm : (((vm>>4)&0xF)*10 + (vm&0x0F));
+}
+
+static void rtc_read_date(int *m, int *d) {
+    while (cmos_read(0x0A) & 0x80);
+    int regb = cmos_read(0x0B);
+    int bin = regb & 4;
+    int vm = cmos_read(0x08), vd = cmos_read(0x07);
+    if (bin) { *m = vm; *d = vd; }
+    else { *m = ((vm>>4)*10)+(vm&0x0F); *d = ((vd>>4)*10)+(vd&0x0F); }
 }
 
 #define BG      0x0A0A28
@@ -116,6 +132,18 @@ static void play_click(void) {
     outb(0x61, tmp | 3);
     for (volatile int i = 0; i < 2000000; i++);
     outb(0x61, tmp & 0xFC);
+}
+
+static void play_jingle_bells(void) {
+    if (!ac97_initialized) return;
+    // Short Jingle Bells — non-blocking via speaker_tone + delay per note
+    int _nj_notes[] = {659,659,659,784,523,587,659, 698,698,698,698,698,659,659, 784,784,587,523};
+    int _nj_durs[] = {80,80,160,80,80,80,200, 80,80,80,80,80,80,80, 120,120,120,300};
+    for (int _ni = 0; _ni < 18; _ni++) {
+        speaker_tone(_nj_notes[_ni]);
+        for (volatile int _nd = 0; _nd < _nj_durs[_ni] * 12000; _nd++) asm volatile("pause");
+    }
+    speaker_off();
 }
 
 static void animate_bar(int x, int y, int w, int target) {
@@ -163,6 +191,8 @@ static int serial_read_timeout(char *c, int max_loops) {
     }
     return 0;
 }
+
+#include "system_transfer.c"
 
 #define MAX_POSTS 20
 
@@ -319,8 +349,15 @@ int ai_active = 0, ai_pos = 0, ai_response = 0;
 char ai_buf[128] = {0};
 // Screensaver
 int idle_ticks = 0, ss_active = 0, ss_frame = 0;
+// Viteza Wii
+int _wii_boot = 0;
+// Christmas easter egg
+int _natal_mode = 0;
+int _natal_snow[64][2];
+int _santa_x = -100, _santa_y = 80, _santa_f = 0;
 // Menu bar icon positions
-int cc_icon_x = 0, nc_icon_x = 0;
+int cc_icon_x = 0, nc_icon_x = 0, wifi_icon_x = 0;
+const char *_app_name = "Finder";
 // Launchpad
 int lp_sel_x = 0, lp_sel_y = 0;
 // Tetris
@@ -328,6 +365,17 @@ int tet_grid[10][18]; int tet_piece = 0, tet_rot = 0, tet_x = 3, tet_y = 0, tet_
 
 // Snake
 int snake_body[400][2]; int snake_len = 3, snake_dir = 0, snake_food_x = 8, snake_food_y = 8, snake_score = 0, snake_gameover = 0, snake_drop = 0;
+// Pong
+int pong_py1 = 0, pong_py2 = 0, pong_bx = 0, pong_by = 0, pong_bdx = 2, pong_bdy = 1, pong_s1 = 0, pong_s2 = 0;
+// Paint
+#define _PW 80
+#define _PH 60
+uint32_t _paint_cv[_PW * _PH];
+int _paint_col = 0xFF4444, _paint_lastx = -1, _paint_lasty = -1, _paint_size = 2;
+// Maze
+#define _MW 16
+#define _MH 12
+int _maze_map[_MW*_MH], _maze_px=1, _maze_py=1, _maze_ex=14, _maze_ey=10, _maze_win=0;
 const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 LTS"};
     uint32_t vm_os_color[3] = {0x8888CC,0x4488FF,0xDD8844};
     gfx_print(80, 336, DIM, "TASKS");
@@ -470,103 +518,246 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
 redraw_desktop:
     gfx_clear(0x080818);
     int dm = set_state & 1;
-    // Deep macOS Big Sur-style gradient (dark blue → deep purple)
+    // Rich gradient (deep space → nebula → horizon)
     for (int y = 0; y < h; y++) {
         int t = y * 255 / h;
         int r, g, b;
-        if (dm) {
-            r = 2 + t/60; g = 1 + t/40; b = 8 + t/30;
-            if (y < 180) { int f = 180-y; r = 4+f/40; g = 2+f/60; b = 12+f/15; }
-            if (r > 8) r = 8; if (g > 6) g = 6; if (b > 20) b = 20;
+        if (_natal_mode) {
+            r = 4 + t/30; g = 4 + t/25; b = 16 + t/8;
+            if (y < 100) { int f = 100-y; r = 8+f/12; g = 10+f/15; b = 40+f/6; }
+            if (y > h-80) { int f = y-(h-80); r += f/6; g += f/4; b += f/3; }
+            if (r > 80) r = 80; if (g > 80) g = 80; if (b > 120) b = 120;
+        } else if (dm) {
+            r = 1 + t/80;  g = 1 + t/60;  b = 4 + t/40;
+            if (y < 100) { int f = 100-y; r = 3+f/50; g = 2+f/40; b = 10+f/20; }
+            if (r > 6) r = 6; if (g > 5) g = 5; if (b > 16) b = 16;
         } else {
-            r = 8 + t/30; g = 6 + t/20; b = 24 + t/10;
-            if (y < 180) { int f = 180-y; r = 18+f/12; g = 10+f/20; b = 50+f/6; }
-            if (r > 32) r = 32; if (g > 28) g = 28; if (b > 60) b = 60;
+            r = 4 + t/40;  g = 3 + t/25;  b = 16 + t/12;
+            if (y < 150) { int f = 150-y; r = 16+f/16; g = 10+f/24; b = 44+f/8; }
+            if (r > 32) r = 32; if (g > 28) g = 28; if (b > 64) b = 64;
+            // Nebula accent near top
+            if (y > 80 && y < 280) {
+                int nt = y - 80;
+                r += (nt < 100 ? nt : 200-nt) / 6;
+                g += (nt < 100 ? nt : 200-nt) / 10;
+            }
         }
+        if (r > 60) r = 60; if (g > 55) g = 55; if (b > 80) b = 80;
         gfx_rect(0, y, w, 1, (r<<16)|(g<<8)|b);
     }
-    // Soft radial glow from top-center
-    if (!dm) for (int i = 0; i < 80; i++) {
-        int a = (80-i)*3; if (a > 60) a = 60;
-        gfx_rect(w/2 - i*5, h/5 - i/4, i*10, 2, (a*3/4<<16)|(a/2<<8)|a);
-        gfx_rect(w/2 - i*5, h/5 + i/4, i*10, 2, (a*3/4<<16)|(a/2<<8)|a);
+    // Snow ground when natal
+    if (_natal_mode) {
+        for (int y = h-40; y < h; y++) {
+            int _sn = h-y;
+            int _sr = 0xAA + _sn*3; if (_sr > 255) _sr = 255;
+            int _sg = 0xCC + _sn*2; if (_sg > 255) _sg = 255;
+            int _sb = 0xEE + _sn; if (_sb > 255) _sb = 255;
+            gfx_rect(0, y, w, 1, (_sr<<16)|(_sg<<8)|_sb);
+        }
     }
-    // Soft star glow dots (rounded, no pixels)
-    for (int i = 0; i < (dm ? 20 : 50); i++) {
-        int sx = (i*691+47)%w, sy = (i*983+19)%(h*3/5);
-        int sb = (i*257+13)%6;
+    // Wide radial glow from top-center (softer, wider)
+    if (!dm) for (int i = 0; i < 120; i++) {
+        int a = (120-i)*2; if (a > 50) a = 50;
+        int ww = i*7;
+        gfx_rect(w/2 - ww/2, h/6 - i/5, ww, 2, (a*2/3<<16)|(a/3<<8)|a);
+        gfx_rect(w/2 - ww/2, h/6 + i/5, ww, 2, (a*2/3<<16)|(a/3<<8)|a);
+    }
+    // Stars with varying sizes and brightness
+    int n_stars = dm ? 40 : 120;
+    for (int i = 0; i < n_stars; i++) {
+        int sx = (i*709+53)%w, sy = (i*997+31)%(h*3/5);
+        int sb = (i*311+17)%10;
         if (sb < 2) continue;
-        uint32_t sc = sb > 4 ? (dm ? 0x335577 : 0xAAC0EE) : (sb > 2 ? (dm ? 0x224466 : 0x8899CC) : (dm ? 0x1A3355 : 0x6677AA));
-        gfx_fill_round_rect(sx-1, sy-1, 3, 3, 1, sc);
+        int sz = (sb > 7) ? 2 : 1;
+        uint32_t sc;
+        if (_natal_mode) {
+            if (sb > 7) sc = 0xFF4444;
+            else if (sb > 4) sc = 0x44FF44;
+            else sc = 0xFFFFFF;
+        } else {
+            if (sb > 7) sc = dm ? 0x446688 : 0xCCDDFF;
+            else if (sb > 4) sc = dm ? 0x335577 : 0x99AACC;
+            else sc = dm ? 0x224466 : 0x667799;
+        }
+        gfx_fill_round_rect(sx-sz+1, sy-sz+1, sz*2-1, sz*2-1, sz, sc);
+        // Brighter core for larger stars
+        if (sz > 1) gfx_putpixel(sx, sy, dm ? 0x88BBEE : 0xFFFFFF);
+    }
+    // Christmas easter egg: snowflakes + tree
+    if (_natal_mode) {
+        // Falling snowflakes
+        static int _nsf = 0; _nsf++;
+        for (int _nf = 0; _nf < 64; _nf++) {
+            _natal_snow[_nf][1] = (_natal_snow[_nf][1] + 1 + (_nf % 3)) % h;
+            _natal_snow[_nf][0] = (_natal_snow[_nf][0] + ((_nf * 7 + _nsf / 20) % 3) - 1) % w;
+            if (_natal_snow[_nf][0] < 0) _natal_snow[_nf][0] += w;
+            gfx_putpixel(_natal_snow[_nf][0], _natal_snow[_nf][1], 0xFFFFFF);
+            if (_nf % 5 == 0) gfx_putpixel(_natal_snow[_nf][0] + 1, _natal_snow[_nf][1], 0xFFFFFF);
+        }
+        // Christmas tree (bottom-left)
+        int _tx = 30, _ty = h - 180;
+        for (int _tr = 0; _tr < 5; _tr++) {
+            int _tw = 18 + _tr * 8, _th = 25;
+            uint32_t _tc = _tr % 2 == 0 ? 0x228833 : 0x1A7722;
+            for (int _y = 0; _y < _th; _y++) {
+                int _tlw = _tw - (_y * _tw / _th) / 2;
+                gfx_rect(_tx - _tlw / 2, _ty + _tr * _th + _y, _tlw, 1, _tc & 0xFEFEFE);
+            }
+        }
+        // Trunk
+        gfx_rect(_tx - 4, _ty + 125, 8, 20, 0x664422);
+        gfx_rect(_tx - 3, _ty + 126, 6, 18, 0x885533);
+        // Ornaments on tree
+        gfx_fill_round_rect(_tx - 8, _ty + 10, 6, 6, 3, 0xFF2222);
+        gfx_fill_round_rect(_tx + 5, _ty + 35, 6, 6, 3, 0x2222FF);
+        gfx_fill_round_rect(_tx - 10, _ty + 55, 6, 6, 3, 0xFFDD00);
+        gfx_fill_round_rect(_tx + 8, _ty + 70, 6, 6, 3, 0xFF4444);
+        gfx_fill_round_rect(_tx - 6, _ty + 95, 6, 6, 3, 0x44AAFF);
+        // Star on top
+        gfx_fill_round_rect(_tx - 4, _ty - 10, 8, 8, 4, 0xFFDD00);
+        gfx_print_scaled(_tx - 3, _ty - 20, 0xFFDD00, "*", 1);
+        // Candles near the tree
+        static int _cfl = 0; _cfl++;
+        for (int _cn = 0; _cn < 3; _cn++) {
+            int _cx = _tx + 70 + _cn * 22, _cy = _ty + 100 + _cn * 8;
+            int _ch = 25 + _cn * 5;
+            gfx_rect(_cx-2, _cy-_ch, 4, _ch, 0xDDCC88);
+            gfx_rect(_cx-1, _cy-_ch, 2, _ch-2, 0xEEDDAA);
+            gfx_fill_round_rect(_cx-3, _cy-_ch-6, 6, 6, 3, 0xFF6600);
+            gfx_putpixel(_cx, _cy-_ch-8, 0xFFFF44);
+            int _gf = (_cfl/20+_cn*7)%4;
+            gfx_fill_round_rect(_cx-5-_gf, _cy-_ch-9-_gf, 10+_gf*2, 10+_gf*2, 6, 0xFF660022);
+        }
+        // Merry Christmas text
+        gfx_print_scaled(w/2 - 90, 28, 0xFF4444, "BUON NATALE!", 2);
+        gfx_print_scaled(w/2 - 80, 52, 0x44FF44, "Merry Christmas", 1);
     }
 
     // ─── Top menu bar (macOS style) ───
     int mby = 0, mbh = 24;
     dm = set_state & 1;
-    gfx_rect(0, mby, w, mbh, dm ? 0x06060E : 0x0A0A1C);
-    gfx_rect(0, mby+mbh-1, w, 1, dm ? 0x101020 : 0x1A1A3A);
-    gfx_print(10, 5, dm ? 0x556688 : 0x8899CC, "Viteza");
+    if (_natal_mode) {
+        gfx_rect(0, mby, w, mbh, 0x0A0400);
+        gfx_rect(0, mby+mbh-1, w, 1, 0x660000);
+        gfx_fill_round_rect(7, 5, 12, 12, 6, 0x440000);
+        gfx_fill_round_rect(7, 5, 12, 12, 6, 0xCC2222);
+        gfx_fill_round_rect(8, 6, 10, 5, 4, 0xFF4444);
+        gfx_putpixel(12, 10, 0xFFFF44);
+        gfx_print(24, 5, 0xFF4444, "Viteza");
+        gfx_print(w-200, 5, 0x44FF44, "🎄 BUON NATALE!");
+    } else {
+        gfx_rect(0, mby, w, mbh, dm ? 0x06060E : 0x0A0A1C);
+        gfx_rect(0, mby+mbh-1, w, 1, dm ? 0x101020 : 0x1A1A3A);
+        gfx_fill_round_rect(7, 5, 12, 12, 6, 0x000018);
+        gfx_fill_round_rect(7, 5, 12, 12, 6, dm ? 0x2A4A8A : 0x3A6AFF);
+        gfx_fill_round_rect(8, 6, 10, 5, 4, dm ? 0x4A7ACC : 0x6A9AFF);
+        gfx_putpixel(12, 10, dm ? 0x88CCFF : 0xFFFFFF);
+        gfx_print(24, 5, dm ? 0x6677AA : 0x8899CC, "Viteza");
+    }
+    // App name when window is open
+    _app_name = "Finder";
+    if(win && win_type > 0 && win_type < 33) {
+        switch(win_type){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="App Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break;
+        }
+        gfx_rect(85, 6, 2, 12, dm ? 0x1A1A3A : 0x2A2A5A);
+        gfx_print(92, 5, dm ? 0x8899CC : 0xAABBEE, _app_name);
+    }
     int _hr = 12, _mn = 0; rtc_read(&_hr, &_mn);
     char _time[6]; _time[0]='0'+_hr/10; _time[1]='0'+_hr%10; _time[2]=':';
     _time[3]='0'+_mn/10; _time[4]='0'+_mn%10; _time[5]=0;
     // Right-side items in menu bar
     int mb_rx = w-10, _clk_x;
+    uint32_t _mic = _natal_mode ? 0xFF4444 : 0x5566AA;
+    uint32_t _mic2 = _natal_mode ? 0x44FF44 : 0x5566AA;
     // Battery
-    gfx_round_rect(mb_rx-24, 6, 18, 10, 2, 0x5566AA);
-    gfx_rect(mb_rx-6, 8, 3, 6, 0x5566AA);
-    gfx_fill_round_rect(mb_rx-22, 8, 10, 6, 2, 0x44AA66);
+    gfx_round_rect(mb_rx-24, 6, 18, 10, 2, _mic);
+    gfx_rect(mb_rx-6, 8, 3, 6, _mic);
+    gfx_fill_round_rect(mb_rx-22, 8, 10, 6, 2, _natal_mode ? 0xFF4444 : 0x44AA66);
     mb_rx -= 34;
     // Clock
     _clk_x = mb_rx-50;
-    gfx_print(_clk_x, 5, TEXT, _time);
+    gfx_print(_clk_x, 5, _natal_mode ? 0xFF6666 : TEXT, _time);
     mb_rx -= 56;
+    // Christmas countdown
+    if (_natal_mode) {
+        int _mm, _dd; rtc_read_date(&_mm, &_dd);
+        int _left = 25 - _dd;
+        if (_mm == 12 && _left >= 0) {
+            char _cd[20]; int _ci=0;
+            if (_left == 0) { _cd[0]='N';_cd[1]='A';_cd[2]='T';_cd[3]='A';_cd[4]='L';_cd[5]='E';_cd[6]=0; }
+            else if (_left < 10) { _cd[0]='0'+_left; _cd[1]='d'; _cd[2]=0; }
+            else { _cd[0]='0'+_left/10; _cd[1]='0'+_left%10; _cd[2]='d'; _cd[3]=0; }
+            mb_rx -= 40;
+            gfx_print(mb_rx+2, 5, 0x44FF44, _cd);
+        }
+    }
     // Notification Center icon (bell)
     nc_icon_x = mb_rx - 16;
-    gfx_round_rect(nc_icon_x, 5, 12, 12, 2, 0x5566AA);
-    gfx_fill_round_rect(nc_icon_x+4, 4, 4, 2, 1, 0x5566AA);
-    gfx_fill_round_rect(nc_icon_x+3, 9, 6, 2, 1, 0x5566AA);
-    gfx_rect(nc_icon_x+4, 10, 4, 2, 0x5566AA);
+    gfx_round_rect(nc_icon_x, 5, 12, 12, 2, _mic2);
+    gfx_fill_round_rect(nc_icon_x+4, 4, 4, 2, 1, _mic2);
+    gfx_fill_round_rect(nc_icon_x+3, 9, 6, 2, 1, _mic2);
+    gfx_rect(nc_icon_x+4, 10, 4, 2, _mic2);
     mb_rx -= 20;
     // Control Center icon (3 lines)
     cc_icon_x = mb_rx - 14;
-    gfx_rect(cc_icon_x, 7, 10, 2, 0x5566AA);
-    gfx_rect(cc_icon_x, 11, 10, 2, 0x5566AA);
-    gfx_rect(cc_icon_x, 15, 10, 2, 0x5566AA);
+    gfx_rect(cc_icon_x, 7, 10, 2, _mic2);
+    gfx_rect(cc_icon_x, 11, 10, 2, _mic2);
+    gfx_rect(cc_icon_x, 15, 10, 2, _mic2);
     mb_rx -= 18;
     // Wi-Fi icon
-    gfx_fill_round_rect(mb_rx-16, 8, 10, 2, 1, 0x5566AA);
-    gfx_putpixel(mb_rx-11, 7, 0x5566AA);
-    gfx_putpixel(mb_rx-11, 15, 0x5566AA);
+    wifi_icon_x = mb_rx - 16;
+    gfx_fill_round_rect(mb_rx-16, 8, 10, 2, 1, _mic2);
+    gfx_putpixel(mb_rx-11, 7, _mic2);
+    gfx_putpixel(mb_rx-11, 15, _mic2);
     // Separator
     mb_rx -= 14;
-    gfx_rect(mb_rx-10, 5, 1, 14, 0x1A1A3A);
+    gfx_rect(mb_rx-10, 5, 1, 14, _natal_mode ? 0x440000 : 0x1A1A3A);
 
     // ─── Dock (macOS style) ───
-    int dc_w = 640, dc_h = 56, dc_r = 28;
-    int dc_x = w/2 - dc_w/2, dc_y = h - dc_h - 8;
-    // Dock shadow
-    gfx_fill_round_rect(dc_x+3, dc_y+3, dc_w, dc_h, dc_r, 0x000000);
+    int dc_w = 640, dc_h = 60, dc_r = 30;
+    int dc_x = w/2 - dc_w/2, dc_y = h - dc_h - 10;
+    // Deep shadow
+    gfx_fill_round_rect(dc_x+4, dc_y+4, dc_w, dc_h, dc_r, 0x000000);
+    gfx_fill_round_rect(dc_x+2, dc_y+2, dc_w, dc_h, dc_r, 0x000000);
     // Dock background (glass-like)
-    gfx_fill_round_rect(dc_x, dc_y, dc_w, dc_h, dc_r, dm ? 0x060612 : 0x0C0C24);
-    gfx_round_rect(dc_x, dc_y, dc_w, dc_h, dc_r, dm ? 0x18183A : 0x2A2A5A);
-    gfx_round_rect(dc_x+1, dc_y+1, dc_w-2, dc_h-2, dc_r-1, dm ? 0x0E0E2A : 0x1A1A4A);
-    // Glass highlight line
-    gfx_rect(dc_x+20, dc_y+3, dc_w-40, 1, dm ? 0x1A2A4A : 0x3A4A7A);
+    uint32_t dk_bg = _natal_mode ? 0x080400 : (dm ? 0x04040E : 0x080820);
+    uint32_t dk_bd = _natal_mode ? 0x660000 : (dm ? 0x1A1A3A : 0x2A2A5A);
+    uint32_t dk_bd2 = _natal_mode ? 0x440000 : (dm ? 0x0E0E2A : 0x1A1A4A);
+    gfx_fill_round_rect(dc_x, dc_y, dc_w, dc_h, dc_r, dk_bg);
+    gfx_round_rect(dc_x, dc_y, dc_w, dc_h, dc_r, dk_bd);
+    gfx_round_rect(dc_x+1, dc_y+1, dc_w-2, dc_h-2, dc_r-1, dk_bd2);
+    // Glass highlight line (brighter at center, fading to edges)
+    for (int i = 0; i < dc_w-80; i += 4) {
+        int a = 40 - (i < (dc_w-80)/2 ? i : (dc_w-80)-i) * 30 / ((dc_w-80)/2);
+        if (a < 8) a = 8;
+        uint32_t hl = (a*3/4<<16)|(a/2<<8)|a;
+        gfx_rect(dc_x+40+i, dc_y+3, 4, 1, hl);
+    }
     gfx_rect(dc_x+40, dc_y+4, dc_w-80, 1, dm ? 0x121A3A : 0x2A3A6A);
-    // Subtle dock glow beneath
-    gfx_rect(dc_x+20, dc_y+dc_h, dc_w-40, 1, dm ? 0x0E1A3A : 0x1A2A5A);
-    gfx_rect(dc_x+40, dc_y+dc_h+1, dc_w-80, 1, dm ? 0x060E2A : 0x0A1A4A);
+    // Subtle glow beneath dock
+    for (int i = 0; i < 6; i++) {
+        int a = (6-i) * 3;
+        uint32_t gl = (a/2<<16)|(a/4<<8)|a;
+        gfx_rect(dc_x+30+i*5, dc_y+dc_h+i, dc_w-60-i*10, 1, gl);
+    }
 
     // ─── Dock Icons — macOS quality, no pixels ───
     int di_y = dc_y + 8, di_sz = 40, di_sp = 56;
-    int di_base = dc_x + (dc_w - 9*di_sp)/2;
+    int di_base = dc_x + (dc_w - 10*di_sp)/2;
     int di_x, di_cy;
 
     #define di_sh(_i,_c) do {\
         di_x = di_base + (_i)*di_sp; di_cy = di_y;\
         gfx_fill_round_rect(di_x+1,di_cy+1,di_sz,di_sz,9,0x000000);\
+        if (_natal_mode) {\
+            uint32_t _gg = (_i%2==0)?0x44FF4444:0xFF444444;\
+            for (int _ni = 0; _ni < 4; _ni++) {\
+                uint32_t _gac = (_i%2==0)?(0x440000+_ni*0x004400):(0x000044+_ni*0x440000);\
+                gfx_fill_round_rect(di_x-2-_ni,di_cy-2-_ni,di_sz+4+_ni*2,di_sz+4+_ni*2,12+_ni*2,_gac);\
+            }\
+        }\
         gfx_fill_round_rect(di_x,di_cy,di_sz,di_sz,10,_c);\
-        gfx_round_rect(di_x,di_cy,di_sz,di_sz,10,0x4A6AAF);\
+        gfx_round_rect(di_x,di_cy,di_sz,di_sz,10,_natal_mode?0xFF4444:0x4A6AAF);\
     } while(0)
 
     // Kairo Games (0) — game controller icon
@@ -657,16 +848,41 @@ redraw_desktop:
         gfx_fill_round_rect(di_x+24,di_cy+22,6,6,2,0xBB44EE);
     }
 
-    // App indicator dots under active icons
-    for (int _di = 0; _di < 9; _di++) {
-        gfx_fill_round_rect(di_base+_di*di_sp+14, dc_y+dc_h-6, 12, 3, 2, 0x3A4A7A);
+    // Viteza Wii (9) — Wii-style white disc + cursor
+    di_sh(9,0xFFFFFF); {
+        gfx_fill_round_rect(di_x+4,di_cy+4,32,32,16,0xE6E6E6);
+        gfx_print_scaled(di_x+11,di_cy+10,0x0055CC,"W",2);
+    }
+    
+    // App indicator dots under active icons (macOS style: small, bright for active)
+    int _active_di = -1;
+    if(win){
+        int _wt = win_type;
+        if(_wt==25)_active_di=0; else if(_wt==3)_active_di=1;
+        else if(_wt==4)_active_di=2; else if(_wt==5)_active_di=3;
+        else if(_wt==6)_active_di=4; else if(_wt==7)_active_di=5;
+        else if(_wt==8)_active_di=6; else if(_wt==18)_active_di=7;
+        else if(_wt==24)_active_di=8; else if(_wt==28)_active_di=9;
+    }
+    for (int _di = 0; _di < 10; _di++) {
+        int _dot_x = di_base+_di*di_sp+16;
+        int _dot_w = 8;
+        if(_di == _active_di){
+            gfx_fill_round_rect(_dot_x-1, dc_y+dc_h-5, _dot_w+2, 4, 2, 0x4488FF);
+            gfx_fill_round_rect(_dot_x, dc_y+dc_h-4, _dot_w, 2, 1, 0x88BBFF);
+        } else {
+            gfx_fill_round_rect(_dot_x+1, dc_y+dc_h-4, _dot_w-2, 2, 1, 0x2A3A5A);
+        }
     }
 
-    // Separator + Trash on right side
-    int dc_tr = dc_x+dc_w-40;
-    gfx_rect(dc_tr-8, dc_y+10, 1, dc_h-20, 0x2A2A5A);
-    gfx_rect(dc_tr-6, dc_y+18, 14, 16, 0x3A4A6A);
-    gfx_rect(dc_tr-2, dc_y+14, 6, 4, 0x3A4A6A);
+    // Separator + Trash on right side (macOS style)
+    int dc_tr = dc_x+dc_w-38;
+    gfx_rect(dc_tr-6, dc_y+12, 1, dc_h-24, dm ? 0x1A1A3A : 0x2A2A5A);
+    // Trash bin
+    gfx_round_rect(dc_tr, dc_y+16, 12, 14, 3, dm ? 0x3A4A6A : 0x4A5A7A);
+    gfx_fill_round_rect(dc_tr+1, dc_y+15, 10, 4, 2, dm ? 0x3A4A6A : 0x4A5A7A);
+    gfx_rect(dc_tr+3, dc_y+19, 6, 8, dm ? 0x1A2A3A : 0x2A3A4A);
+    gfx_rect(dc_tr+5, dc_y+20, 2, 6, dm ? 0x3A4A5A : 0x5A6A7A);
 
     // Notes widget on desktop (initial draw)
     gfx_fill_round_rect(30,90,210,140,8,0x080820);
@@ -708,6 +924,16 @@ redraw_desktop:
         _time[3]='0'+_mn/10;_time[4]='0'+_mn%10;_time[5]=0;\
         gfx_rect(_clk_x,5,55,12,0x0A0A1C);\
         gfx_print(_clk_x,5,TEXT,_time);\
+        /* Wi-Fi signal animation */\
+        if(wifi_icon_x){\
+            int _wsig = (_tick/6) % 5;\
+            gfx_rect(wifi_icon_x,6,12,10,0x0A0A1C);\
+            for(int _wb=0;_wb<4;_wb++){\
+                int _bh = _wb*3+2;\
+                uint32_t _wc = (_wb <= _wsig-1) ? 0x66CCFF : 0x2A3A5A;\
+                gfx_fill_round_rect(wifi_icon_x+1+_wb*3,15-_bh,2,_bh,1,_wc);\
+            }\
+        }\
         /* Refresh desktop digital clock widget */\
         if(!win){\
             char _wd[9];_wd[0]='0'+_hr/10;_wd[1]='0'+_hr%10;_wd[2]=':';\
@@ -716,6 +942,22 @@ redraw_desktop:
             gfx_fill_round_rect(dc_x2,dc_y2,140,60,8,_dmc?0x040410:0x080820);\
             gfx_print_scaled(dc_x2+16,dc_y2+8,_dmc?0x3366CC:0x4488FF,_wd,2);\
             gfx_print(dc_x2+12,dc_y2+44,_dmc?0x1A2A4A:0x3A4A6A,"Viteza OS");\
+        }\
+        /* Desktop star twinkling */\
+        if(!win && !cc_active && !nc_active){\
+            int _isdm = set_state & 1;\
+            int _nst = _isdm ? 20 : 60;\
+            for(int _si=0;_si<3;_si++){\
+                int _sidx = ((_tick*13+_si*17)*7+_tick/10)%_nst;\
+                int _sx = (_sidx*691+47)%w;\
+                int _sy = (_sidx*983+19)%(h*3/5);\
+                int _phase = (_tick + _sidx*3 + _si*7) % 18;\
+                uint32_t _sc;\
+                if(_phase < 4) _sc = _isdm ? 0x1A3355 : 0x445577;\
+                else if(_phase < 11) _sc = _isdm ? 0x4466AA : 0xAABBEE;\
+                else _sc = _isdm ? 0x6688CC : 0xCCDDFF;\
+                gfx_fill_round_rect(_sx-1,_sy-1,3,3,1,_sc);\
+            }\
         }\
     } while(0)
 
@@ -997,34 +1239,62 @@ redraw_desktop:
     // macOS window chrome — realistic traffic light buttons with shine
     #define draw_mac_title(k_) do {\
         int _dmc = set_state & 1;\
-        gfx_fill_round_rect(wx+4,wy+4,ww-8,30,8,_dmc?0x141430:0x1E1E3E);\
-        gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,_dmc?0x1A1A38:0x282852);\
-        gfx_rect(wx+8,wy+22,ww-16,12,_dmc?0x141430:0x1E1E3E);\
-        gfx_rect(wx+4,wy+35,ww-8,1,_dmc?0x24244A:0x3A3A6A);\
-        gfx_print(wx+ww/2-28,wy+7,_dmc?0x667799:0x8899CC,k_);\
-        /* Close — red with shine */\
-        gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xDD4A4A);\
-        gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF7A7A);\
-        gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
-        /* Minimise — yellow with shine */\
-        gfx_fill_round_rect(wx+26,wy+8,12,12,6,0xCCAA33);\
-        gfx_fill_round_rect(wx+28,wy+9,4,3,2,0xEECC66);\
-        gfx_fill_round_rect(wx+27,wy+9,2,2,1,0xEEDD88);\
-        /* Zoom — green with shine */\
-        gfx_fill_round_rect(wx+42,wy+8,12,12,6,0x44AA44);\
-        gfx_fill_round_rect(wx+44,wy+9,4,3,2,0x66DD66);\
-        gfx_fill_round_rect(wx+43,wy+9,2,2,1,0x88EE88);\
+        if (_natal_mode) {\
+            gfx_fill_round_rect(wx+4,wy+4,ww-8,30,8,0x1A0404);\
+            gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,0x2A0A0A);\
+            gfx_rect(wx+8,wy+22,ww-16,12,0x1A0404);\
+            gfx_rect(wx+4,wy+35,ww-8,1,0x660000);\
+            gfx_print(wx+ww/2-28,wy+7,0xFF6644,k_);\
+            gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xCC3333);\
+            gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF6666);\
+            gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
+            gfx_fill_round_rect(wx+26,wy+8,12,12,6,0x44AA44);\
+            gfx_fill_round_rect(wx+28,wy+9,4,3,2,0x66DD66);\
+            gfx_fill_round_rect(wx+27,wy+9,2,2,1,0x88EE88);\
+            gfx_fill_round_rect(wx+42,wy+8,12,12,6,0xDDAA22);\
+            gfx_fill_round_rect(wx+44,wy+9,4,3,2,0xEECC44);\
+            gfx_fill_round_rect(wx+43,wy+9,2,2,1,0xFFEE66);\
+        } else {\
+            gfx_fill_round_rect(wx+4,wy+4,ww-8,30,8,_dmc?0x141430:0x1E1E3E);\
+            gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,_dmc?0x1A1A38:0x282852);\
+            gfx_rect(wx+8,wy+22,ww-16,12,_dmc?0x141430:0x1E1E3E);\
+            gfx_rect(wx+4,wy+35,ww-8,1,_dmc?0x24244A:0x3A3A6A);\
+            gfx_print(wx+ww/2-28,wy+7,_dmc?0x667799:0x8899CC,k_);\
+            gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xDD4A4A);\
+            gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF7A7A);\
+            gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
+            gfx_fill_round_rect(wx+26,wy+8,12,12,6,0xCCAA33);\
+            gfx_fill_round_rect(wx+28,wy+9,4,3,2,0xEECC66);\
+            gfx_fill_round_rect(wx+27,wy+9,2,2,1,0xEEDD88);\
+            gfx_fill_round_rect(wx+42,wy+8,12,12,6,0x44AA44);\
+            gfx_fill_round_rect(wx+44,wy+9,4,3,2,0x66DD66);\
+            gfx_fill_round_rect(wx+43,wy+9,2,2,1,0x88EE88);\
+        }\
     } while(0)
 
     #define open_app(n) do {\
         win=1;win_type=n;\
-        gfx_fill_round_rect(wx+5,wy+7,ww,wh,12,0x000010);\
-        gfx_fill_round_rect(wx+3,wy+5,ww,wh,12,0x00081A);\
-        gfx_fill_round_rect(wx+6,wy+6,ww,wh,12,0x000000);\
-        gfx_fill_round_rect(wx+3,wy+3,ww,wh,12,0x060620);\
-        gfx_fill_round_rect(wx,wy,ww,wh,12,0x141452);\
-        gfx_round_rect(wx,wy,ww,wh,12,0x4A6ADF);\
-        gfx_round_rect(wx+1,wy+1,ww-2,wh-2,11,0x2A4ABE);\
+        /* Set app name for menu bar */\
+        switch(n){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break;\
+        }\
+        /* Outer shadow (wide, soft) */\
+        gfx_fill_round_rect(wx+10,wy+12,ww,wh,12,0x000008);\
+        gfx_fill_round_rect(wx+8,wy+10,ww,wh,12,0x00000C);\
+        gfx_fill_round_rect(wx+6,wy+8,ww,wh,12,0x000010);\
+        /* Inner shadow (tight, dark) */\
+        gfx_fill_round_rect(wx+4,wy+6,ww,wh,12,0x000018);\
+        gfx_fill_round_rect(wx+2,wy+4,ww,wh,12,0x00001E);\
+        /* Window body */\
+        gfx_fill_round_rect(wx,wy,ww,wh,12,0x0E0E28);\
+        gfx_round_rect(wx,wy,ww,wh,12,0x3A5ADF);\
+        gfx_round_rect(wx+1,wy+1,ww-2,wh-2,11,0x2A3ABE);\
+        gfx_fill_round_rect(wx+2,wy+2,ww-4,14,10,0x141430);\
+        gfx_rect(wx+4,wy+14,ww-8,2,0x0E0E28);\
+        /* Update menu bar app name */\
+        int _dmc = set_state & 1;\
+        gfx_rect(83,4,140,16,_dmc?0x06060E:0x0A0A1C);\
+        gfx_rect(85,6,2,12,_dmc?0x1A1A3A:0x2A2A5A);\
+        gfx_print(92,5,_dmc?0x8899CC:0xAABBEE,_app_name);\
     } while(0)
 
     // Add a wrapped terminal line (max 38 chars per line, properly multi-line)
@@ -1073,22 +1343,28 @@ redraw_desktop:
 
     // Redraw terminal window — green-on-black hacker style
     #define term_redraw() do {\
-        gfx_fill_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x050508);\
-        gfx_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x0A3A0A);\
+        if (_natal_mode) {\
+            gfx_fill_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x080400);\
+            gfx_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x660000);\
+        } else {\
+            gfx_fill_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x050508);\
+            gfx_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x0A3A0A);\
+        }\
         char _pb[80]; int _pi,_pn=0;\
         char _pfix[40]; int _pf=0;\
         {char _ws[]="user@viteza:~$ ";for(_pf=0;_ws[_pf];_pf++)_pfix[_pf]=_ws[_pf];_pfix[_pf]=0;}\
         for(_pi=0;_pfix[_pi];_pi++)_pb[_pn++]=_pfix[_pi];\
         for(_pi=0;_pi<term_pos&&_pi<44;_pi++)_pb[_pn++]=term_buf[_pi];\
         _pb[_pn]=0;\
-        gfx_print(wx+16,wy+44+wh-56-16,0x00FF44,_pb);\
+        gfx_print(wx+16,wy+44+wh-56-16,_natal_mode?0xFF4444:0x00FF44,_pb);\
         int _ml = (wh-72)/16 - 1; if(_ml<1) _ml=1;\
         int _start = term_scroll - _ml + 1; if(_start<0) _start=0;\
         int _ty = wy+56;\
         for(int _i=_start; _i<=term_scroll && _i<term_line_count; _i++){\
-            uint32_t _tc = 0x00CC44;\
-            if(term_lines[_i][0]=='['){_tc=0x00AA44;}if(term_lines[_i][0]=='#'){_tc=0xFF4444;}\
+            uint32_t _tc = _natal_mode?0xFF6644:0x00CC44;\
+            if(term_lines[_i][0]=='['){_tc=_natal_mode?0x44FF44:0x00AA44;}if(term_lines[_i][0]=='#'){_tc=0xFF4444;}\
             if(term_lines[_i][0]=='%'){_tc=0xFFFF44;}\
+            if(_natal_mode&&_i==term_line_count-1&&term_lines[_i][0]==0xE2){_tc=0x44FF44;}\
             gfx_print(wx+16,_ty,_tc,term_lines[_i]); _ty+=16;\
         }\
     } while(0)
@@ -1193,6 +1469,19 @@ redraw_desktop:
     } while(0)
 
     draw_cursor();
+    // Snowflake cursor in Christmas mode
+    if (_natal_mode) {
+        int _cmx = mouse_get_x(), _cmy = mouse_get_y();
+        gfx_putpixel(_cmx, _cmy-4, 0xFFFFFF);
+        gfx_putpixel(_cmx, _cmy+4, 0xFFFFFF);
+        gfx_putpixel(_cmx-4, _cmy, 0xFFFFFF);
+        gfx_putpixel(_cmx+4, _cmy, 0xFFFFFF);
+        gfx_putpixel(_cmx-3, _cmy-3, 0xFFFFFF);
+        gfx_putpixel(_cmx+3, _cmy+3, 0xFFFFFF);
+        gfx_putpixel(_cmx-3, _cmy+3, 0xFFFFFF);
+        gfx_putpixel(_cmx+3, _cmy-3, 0xFFFFFF);
+        gfx_putpixel(_cmx, _cmy, 0xFFFF44);
+    }
     mouse_poll();
 
     // Debug: USB count + AC97 status
@@ -1201,10 +1490,59 @@ redraw_desktop:
     extern int ac97_is_init(void);
     gfx_print(48, 4, ac97_is_init() ? 0x00FF00 : 0xFF4444, ac97_is_init() ? "A:OK" : "A:NO");
 
+    char k;
     while (1) {
         mouse_poll();
         draw_cursor();
-        char k = keyboard_last_char();
+        if (_natal_mode) {
+            int _cmx = mouse_get_x(), _cmy = mouse_get_y();
+            gfx_putpixel(_cmx, _cmy-4, 0xFFFFFF);
+            gfx_putpixel(_cmx, _cmy+4, 0xFFFFFF);
+            gfx_putpixel(_cmx-4, _cmy, 0xFFFFFF);
+            gfx_putpixel(_cmx+4, _cmy, 0xFFFFFF);
+            gfx_putpixel(_cmx-3, _cmy-3, 0xFFFFFF);
+            gfx_putpixel(_cmx+3, _cmy+3, 0xFFFFFF);
+            gfx_putpixel(_cmx-3, _cmy+3, 0xFFFFFF);
+            gfx_putpixel(_cmx+3, _cmy-3, 0xFFFFFF);
+            gfx_putpixel(_cmx, _cmy, 0xFFFF44);
+        }
+        // Dock hover magnification + click
+        static int _pdh = -2;
+        int _mhx = mouse_get_x(), _mhy = mouse_get_y();
+        int _ddcx = w/2 - 320, _ddcy = h - 70, _dhov = -1;
+        int _dhbase = _ddcx + (640 - 9*56)/2;
+        if (_mhy >= _ddcy - 5) {
+            for (int _di = 0; _di < 9; _di++) {
+                int _ix = _dhbase + _di*56;
+                if (_mhx >= _ix && _mhx <= _ix + 40) { _dhov = _di; break; }
+            }
+        }
+        if (_dhov >= 0) {
+            int _hx = _dhbase + _dhov*56;
+            uint32_t _mcols[] = {0xCC44AA,0x2A2A3A,0x4A4A5A,0x5A3A8A,0x3A3A4A,0xDDAA33,0x4488FF,0x6A8ABE,0x3A1A5A,0xFFFFFF};
+            const char *_dinit[] = {"G","T","S","O","C","N","A","W","T","W"};
+            const char *_dnm[] = {"Games","Terminal","Settings","OreoAI","Calculator","Notes","App Store","Weather","Tetris","Wii Menu"};
+            int _msz = 54, _mx = _hx - 7, _my = _ddcy - 10;
+            gfx_fill_round_rect(_mx+3, _my+3, _msz, _msz, 14, 0x000000);
+            gfx_fill_round_rect(_mx, _my, _msz, _msz, 14, _mcols[_dhov]);
+            gfx_round_rect(_mx, _my, _msz, _msz, 14, 0x88BBFF);
+            gfx_print_scaled(_mx+12, _my+10, 0xFFFFFF, _dinit[_dhov], 3);
+            const char *_dn = _dnm[_dhov]; int _dl = 0; while(_dn[_dl]) _dl++;
+            int _dx = _hx + 20 - _dl*4;
+            if (_dx < 4) _dx = 4; if (_dx + _dl*8 > w-4) _dx = w-4 - _dl*8;
+            gfx_fill_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x0A0A2A);
+            gfx_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x3A5A8A);
+            gfx_print(_dx, _my-22, 0xFFFFFF, _dn);
+        }
+        // Capture click BEFORE hover redraw so we don't lose it
+        if (mouse_clicked() && !win && !cc_active && !nc_active && _dhov >= 0) {
+            const char *_dkmap = "k345678wgz";
+            char _dc = _dkmap[_dhov];
+            if (_dc) { k = _dc; goto _dock_go; }
+        }
+        if (_dhov != _pdh) { _pdh = _dhov; goto redraw_desktop; }
+        k = keyboard_last_char();
+_dock_go:
 
         // ─── AI Command Mode Overlay ───
         if (ai_active) {
@@ -1324,23 +1662,30 @@ redraw_desktop:
             if (k != 0) idle_ticks = 0;
         }
         if (ss_active) {
+            static int dv_x = 32, dv_y = 16, dv_dx = 1, dv_dy = 1, dv_c = 0;
+            static uint32_t dv_colors[] = {0xFF4444,0x44FF44,0x4488FF,0xFFDD44,0xFF44FF,0x44FFDD,0xFF8844,0xFFFFFF};
+            static int dv_inited = 0;
+            if (!dv_inited) { dv_x=32; dv_y=16; dv_dx=1; dv_dy=1; dv_c=0; dv_inited=1; }
             ss_frame++;
             gfx_clear(0x000008);
-            for (int _si = 0; _si < 120; _si++) {
-                int _sx = (_si*691+ss_frame*2+47)%w, _sy = (_si*983+19)%(h*3/5);
-                int _sd = (ss_frame+_si)%4;
-                uint32_t _sc = 0x2244AA+((_si*37+ss_frame)%64)*0x010101;
-                gfx_fill_round_rect(_sx,_sy,_sd+1,_sd+1,1,_sc);
-            }
-            for (int _pi = 0; _pi < 20; _pi++) {
-                int _px = (_pi*613+ss_frame*5+31)%w, _py = (_pi*829+ss_frame*7+17)%(h-100)+50;
-                int _ps = (_pi*47+ss_frame)%4+1;
-                gfx_fill_round_rect(_px,_py,_ps,_ps,1,0x4466AA+_ps*0x222222);
-            }
-            gfx_print_scaled(w/2-80,h/2-30,0x4488FF,"VITEZA",3);
-            int _vgl = (ss_frame*4)%100;
-            uint32_t _vc2 = 0x224488+((_vgl<50?_vgl*2:(100-_vgl)*2))*0x010101;
-            gfx_print_scaled(w/2-60,h/2+20,_vc2,"v1.0",2);
+            // Draw some subtle grid lines for depth
+            for (int _gi = 0; _gi < w; _gi += 40) gfx_rect(_gi, 0, 1, h, 0x080818);
+            for (int _gj = 0; _gj < h; _gj += 40) gfx_rect(0, _gj, w, 1, 0x080818);
+            // Move the DVD logo
+            dv_x += dv_dx; dv_y += dv_dy;
+            int dv_w = 160, dv_h = 40;
+            if (dv_x <= 0 || dv_x + dv_w >= w) { dv_dx = -dv_dx; dv_c = (dv_c+1)%8; }
+            if (dv_y <= 0 || dv_y + dv_h >= h) { dv_dy = -dv_dy; dv_c = (dv_c+1)%8; }
+            // Clamp
+            if (dv_x < 0) dv_x = 0; if (dv_x + dv_w > w) dv_x = w - dv_w;
+            if (dv_y < 0) dv_y = 0; if (dv_y + dv_h > h) dv_y = h - dv_h;
+            uint32_t dv_color = dv_colors[dv_c];
+            // Draw logo with shadow
+            gfx_fill_round_rect(dv_x+3, dv_y+3, dv_w, dv_h, 10, 0x000000);
+            gfx_fill_round_rect(dv_x, dv_y, dv_w, dv_h, 10, dv_color);
+            gfx_round_rect(dv_x, dv_y, dv_w, dv_h, 10, 0xFFFFFF);
+            gfx_print_scaled(dv_x+20, dv_y+6, 0xFFFFFF, "DVD", 2);
+            gfx_print(dv_x+10, dv_y+26, 0x000000, "KAIRO  OS");
             if (!k) { asm volatile("hlt"); continue; }
             continue;
         }
@@ -1480,6 +1825,7 @@ redraw_desktop:
                             term_add("  whoami   - Show user","");term_add("  ver      - OS version","");
                             term_add("  date     - Show date","");term_add("  neofetch - System info","");
                             term_add("  calc N+M - Addition","");
+                            term_add("  natalize - Christmas mode","");
                         } else if (term_buf[0]=='c'&&term_buf[1]=='l'&&term_buf[2]=='e'&&term_buf[3]=='a'&&term_buf[4]=='r'&&!term_buf[5]) {
                             term_line_count = 0; term_scroll = 0;
                         } else if (term_buf[0]=='w'&&term_buf[1]=='h'&&term_buf[2]=='o'&&term_buf[3]=='a'&&term_buf[4]=='m'&&term_buf[5]=='i'&&!term_buf[6]) {
@@ -1511,6 +1857,15 @@ redraw_desktop:
                             _rs[_ri]=0;
                             for(int _rk=0;_rk<_ri/2;_rk++){char _rt=_rs[_rk];_rs[_rk]=_rs[_ri-1-_rk];_rs[_ri-1-_rk]=_rt;}
                             term_add(_rs,0);
+                        } else if (term_buf[0]=='n'&&term_buf[1]=='a'&&term_buf[2]=='t'&&term_buf[3]=='a'&&term_buf[4]=='l'&&term_buf[5]=='i'&&term_buf[6]=='z'&&term_buf[7]=='e'&&!term_buf[8]) {
+                            _natal_mode = 1;
+                            for(int _ni=0;_ni<64;_ni++){_natal_snow[_ni][0]=(_ni*709+53)%1280;_natal_snow[_ni][1]=(_ni*997+31)%720;}
+                            term_add("🎄 NATALIZZATO! Buon Natale! 🎄",0);
+                            term_add("Il tuo OS ora è tutto natalizio!","");
+                            play_jingle_bells();
+                        } else if (term_buf[0]=='u'&&term_buf[1]=='n'&&term_buf[2]=='n'&&term_buf[3]=='a'&&term_buf[4]=='t'&&term_buf[5]=='a'&&term_buf[6]=='l'&&!term_buf[7]||(term_buf[0]=='n'&&term_buf[1]=='o'&&term_buf[2]=='r'&&term_buf[3]=='m'&&term_buf[4]=='a'&&term_buf[5]=='l'&&term_buf[6]=='i'&&term_buf[7]=='z'&&term_buf[8]=='e'&&!term_buf[9])) {
+                            _natal_mode = 0;
+                            term_add("Natale disattivato. OS normale.","");
                         } else if (term_pos > 0) {
                             term_add("Unknown command. Type 'help'.","");
                         }
@@ -2085,45 +2440,124 @@ redraw_desktop:
             if (win_type == 11) {
                 if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
 
-                gfx_print(wx+16, wy+50, 0x4A9EFF, "Camera — Hardware Status");
-                gfx_rect(wx+16, wy+66, ww-32, 1, 0x2A3A6A);
+                int _cfw = ww-40, _cfh = wh-80, _cfx = wx+20, _cfy = wy+44;
+
+                // Draw camera viewport
+                gfx_fill_round_rect(_cfx,_cfy,_cfw,_cfh,6,0x000000);
+                gfx_round_rect(_cfx,_cfy,_cfw,_cfh,6,camera_is_present()?0x00CC44:0x666666);
 
                 if (camera_is_present()) {
-                    gfx_print(wx+24, wy+80, 0x00CC44, "Device: Present");
-                    gfx_print(wx+24, wy+100, 0x8A9ACE, "Name: ");
-                    gfx_print(wx+80, wy+100, 0xFFFFFF, camera_get_name());
-
-                    gfx_print(wx+24, wy+120, 0x8A9ACE, "Streaming: ");
-                    if (camera_is_streaming()) {
-                        gfx_print(wx+100, wy+120, 0x00CC44, "Active");
-                    } else {
-                        gfx_print(wx+100, wy+120, 0xCCAA00, "Idle  [S]tart stream");
-                    }
-
-                    gfx_print(wx+24, wy+160, 0x6A7A9E, "USB Video Class (UVC) camera detected.");
-                    gfx_print(wx+24, wy+180, 0x6A7A9E, "Full streaming requires interface descriptor");
-                    gfx_print(wx+24, wy+200, 0x6A7A9E, "parsing and isochronous transfer support.");
-
-                    // Toggle streaming on S key
-                    if (k == 's' && camera_is_present()) {
-                        if (camera_is_streaming()) {
-                            camera_stop_stream();
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,wh-64,4,0x0E0E30);
-                        } else {
-                            camera_start_stream();
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,wh-64,4,0x0E0E30);
-                        }
-                        continue;
-                    }
+                    // Real camera detected — show status overlay
+                    gfx_print(_cfx+12, _cfy+10, 0x00CC44, "Camera: Connected");
+                    gfx_print(_cfx+12, _cfy+30, 0x8A9ACE, camera_get_name());
+                    gfx_print(_cfx+12, _cfy+54, camera_is_streaming()?0x00CC44:0xCCAA00,
+                        camera_is_streaming() ? "Streaming: Active" : "Streaming: Idle  [S]");
+                    gfx_print(_cfx+12, _cfy+80, 0x6A7A9E, "USB Video Class detected.");
+                    gfx_print(_cfx+12, _cfy+_cfh-40, 0x3A4A6A, "[Esc] close");
+                    if (k == 's' && !camera_is_streaming()) { camera_start_stream(); continue; }
+                    if (k == 's' && camera_is_streaming()) { camera_stop_stream(); continue; }
                 } else {
-                    gfx_print(wx+24, wy+84, 0xCC4444, "Device: Not Found");
-                    gfx_print(wx+24, wy+110, 0x6A7A9E, "No UVC camera hardware detected.");
-                    gfx_print(wx+24, wy+130, 0x6A7A9E, "Connect a USB Video Class camera and");
-                    gfx_print(wx+24, wy+150, 0x6A7A9E, "re-run. On QEMU, use usb-host passthrough:");
-                    gfx_print(wx+24, wy+170, 0x444488, "  -device usb-host,vendorid=0xXXXX,productid=0xYYYY");
+                    // Simulated webcam — 3D city skyline
+                    #define _Wsin(_a) _ws[((_a)%256+256)%256]
+                    static const int _ws[256] = {0,6,12,18,25,31,37,43,49,56,62,68,74,80,86,92,97,103,109,115,120,126,131,136,142,147,152,157,162,167,171,176,181,185,189,193,197,201,205,209,212,216,219,222,225,228,231,234,236,238,241,243,244,246,248,249,251,252,253,254,254,255,255,255,256,255,255,255,254,254,253,252,251,249,248,246,244,243,241,238,236,234,231,228,225,222,219,216,212,209,205,201,197,193,189,185,181,176,171,167,162,157,152,147,142,136,131,126,120,115,109,103,97,92,86,80,74,68,62,56,49,43,37,31,25,18,12,6,0,-6,-12,-18,-25,-31,-37,-43,-49,-56,-62,-68,-74,-80,-86,-92,-97,-103,-109,-115,-120,-126,-131,-136,-142,-147,-152,-157,-162,-167,-171,-176,-181,-185,-189,-193,-197,-201,-205,-209,-212,-216,-219,-222,-225,-228,-231,-234,-236,-238,-241,-243,-244,-246,-248,-249,-251,-252,-253,-254,-254,-255,-255,-255,-256,-255,-255,-255,-254,-254,-253,-252,-251,-249,-248,-246,-244,-243,-241,-238,-236,-234,-231,-228,-225,-222,-219,-216,-212,-209,-205,-201,-197,-193,-189,-185,-181,-176,-171,-167,-162,-157,-152,-147,-142,-136,-131,-126,-120,-115,-109,-103,-97,-92,-86,-80,-74,-68,-62,-56,-49,-43,-37,-31,-25,-18,-12,-6};
+                    int _ca = _tick, _cx0 = _cfx+_cfw/2, _cy0 = _cfy+_cfh/2;
+                    int _sa = _Wsin(_ca), _caa = _Wsin(_ca+64);
+                    gfx_fill_round_rect(_cfx,_cfy,_cfw,_cfh,6,0x080818);
+                    // Ground plane (dark grid)
+                    for (int _gz = 50; _gz < 500; _gz += 30) {
+                        int _zx = (-_gz*_sa)>>8, _zz = (_gz*_caa+400)>>8;
+                        int _d2 = 500, _s2 = _d2*256/(_zz+_d2);
+                        int _gpx = _cx0 + (_zx*_s2>>8);
+                        int _gpy = _cy0 + 80 + (200*_s2>>8)/2;
+                        if (_gpx >= _cfx && _gpx < _cfx+_cfw && _gpy >= _cfy && _gpy < _cfy+_cfh)
+                            gfx_rect(_gpx-1,_gpy,3,1,0x1A2A4A);
+                    }
+                    // Buildings: pos_x, pos_z, width, depth, height, color
+                    int _nb = 12, _bd[72];
+                    _bd[0]=-120;_bd[1]=80;_bd[2]=40;_bd[3]=40;_bd[4]=120;_bd[5]=0x4488FF;
+                    _bd[6]=-60;_bd[7]=60;_bd[8]=30;_bd[9]=30;_bd[10]=200;_bd[11]=0xFF6644;
+                    _bd[12]=0;_bd[13]=70;_bd[14]=50;_bd[15]=50;_bd[16]=90;_bd[17]=0x44DD88;
+                    _bd[18]=70;_bd[19]=90;_bd[20]=35;_bd[21]=35;_bd[22]=160;_bd[23]=0xCC44AA;
+                    _bd[24]=-80;_bd[25]=180;_bd[26]=45;_bd[27]=45;_bd[28]=80;_bd[29]=0x66AAFF;
+                    _bd[30]=-20;_bd[31]=160;_bd[32]=25;_bd[33]=25;_bd[34]=250;_bd[35]=0xFFAA44;
+                    _bd[36]=40;_bd[37]=140;_bd[38]=40;_bd[39]=40;_bd[40]=110;_bd[41]=0x44FFAA;
+                    _bd[42]=100;_bd[43]=170;_bd[44]=30;_bd[45]=30;_bd[46]=140;_bd[47]=0xDD66BB;
+                    _bd[48]=-100;_bd[49]=280;_bd[50]=50;_bd[51]=50;_bd[52]=60;_bd[53]=0x4488CC;
+                    _bd[54]=30;_bd[55]=260;_bd[56]=35;_bd[57]=35;_bd[58]=180;_bd[59]=0xFF8844;
+                    _bd[60]=90;_bd[61]=300;_bd[62]=45;_bd[63]=45;_bd[64]=100;_bd[65]=0x44DDFF;
+                    _bd[66]=150;_bd[67]=250;_bd[68]=40;_bd[69]=40;_bd[70]=130;_bd[71]=0x8844CC;
+                    for (int _bi = 0; _bi < _nb; _bi++) {
+                        int _bi6 = _bi*6;
+                        int _bx = _bd[_bi6], _bz = _bd[_bi6+1], _bw = _bd[_bi6+2], _bdp = _bd[_bi6+3], _bh = _bd[_bi6+4];
+                        uint32_t _bc = _bd[_bi6+5];
+                        // 8 vertices of building box
+                        int _bv[8][3];
+                        _bv[0][0]=_bx-_bw/2;_bv[0][1]=0;_bv[0][2]=_bz-_bdp/2;
+                        _bv[1][0]=_bx+_bw/2;_bv[1][1]=0;_bv[1][2]=_bz-_bdp/2;
+                        _bv[2][0]=_bx+_bw/2;_bv[2][1]=_bh;_bv[2][2]=_bz-_bdp/2;
+                        _bv[3][0]=_bx-_bw/2;_bv[3][1]=_bh;_bv[3][2]=_bz-_bdp/2;
+                        _bv[4][0]=_bx-_bw/2;_bv[4][1]=0;_bv[4][2]=_bz+_bdp/2;
+                        _bv[5][0]=_bx+_bw/2;_bv[5][1]=0;_bv[5][2]=_bz+_bdp/2;
+                        _bv[6][0]=_bx+_bw/2;_bv[6][1]=_bh;_bv[6][2]=_bz+_bdp/2;
+                        _bv[7][0]=_bx-_bw/2;_bv[7][1]=_bh;_bv[7][2]=_bz+_bdp/2;
+                        int _bpx[8], _bpy[8];
+                        for (int _vi = 0; _vi < 8; _vi++) {
+                            int _x = _bv[_vi][0], _y = _bv[_vi][1], _z = _bv[_vi][2];
+                            int _x1 = (_x*_caa - _z*_sa)>>8;
+                            int _z1 = (_x*_sa + _z*_caa)>>8;
+                            int _d3 = 500, _s3 = _d3*256/(_z1+_d3);
+                            _bpx[_vi] = _cx0 + (_x1*_s3>>8);
+                            _bpy[_vi] = _cy0 + (100*_s3>>8)/2 - (_y*_s3>>8) + 100;
+                        }
+                        // Draw 4 vertical edges + 8 horizontal edges
+                        int _be[24] = {0,1,1,2,2,3,3,0,4,5,5,6,6,7,7,4,0,4,1,5,2,6,3,7};
+                        for (int _ei = 0; _ei < 12; _ei++) {
+                            int _a = _be[_ei*2], _b = _be[_ei*2+1];
+                            int _x1 = _bpx[_a], _y1 = _bpy[_a], _x2 = _bpx[_b], _y2 = _bpy[_b];
+                            // Skip if behind camera
+                            if (_x1 < _cfx-10 && _x2 < _cfx-10) continue;
+                            if (_x1 > _cfx+_cfw+10 && _x2 > _cfx+_cfw+10) continue;
+                            uint32_t _ec = _bc;
+                            if (_ei >= 8) _ec = ((_bc&0xFEFEFE)>>1)+0x222222; // top edges darker
+                            int _dx = _x2-_x1, _dy = _y2-_y1;
+                            int _adx = _dx<0?-_dx:_dx, _ady = _dy<0?-_dy:_dy;
+                            int _err = 0, _lx = _x1, _ly = _y1;
+                            if (_adx > _ady) {
+                                int _sy = _dy < 0 ? -1 : 1;
+                                _err = -_adx;
+                                for (int _li = 0; _li <= _adx; _li++) {
+                                    if (_lx >= _cfx && _lx < _cfx+_cfw && _ly >= _cfy && _ly < _cfy+_cfh) gfx_putpixel(_lx,_ly,_ec);
+                                    _err += _ady*2;
+                                    if (_err > 0) { _ly += _sy; _err -= _adx*2; }
+                                    _lx += (_dx<0 ? -1 : 1);
+                                }
+                            } else {
+                                int _sx = _dx < 0 ? -1 : 1;
+                                _err = -_ady;
+                                for (int _li = 0; _li <= _ady; _li++) {
+                                    if (_lx >= _cfx && _lx < _cfx+_cfw && _ly >= _cfy && _ly < _cfy+_cfh) gfx_putpixel(_lx,_ly,_ec);
+                                    _err += _adx*2;
+                                    if (_err > 0) { _lx += _sx; _err -= _ady*2; }
+                                    _ly += (_dy<0 ? -1 : 1);
+                                }
+                            }
+                        }
+                    }
+                    // Scanline overlay + watermark
+                    int _ct = _tick;
+                    for (int _y = _ct%6; _y < _cfh; _y += 6) {
+                        gfx_rect(_cfx, _cfy+_y, _cfw, 1, 0x00000033);
+                    }
+                    // Neon glow border
+                    for (int _gn = 0; _gn < 3; _gn++) {
+                        uint32_t _gc = _gn==0?0xFF00AA:_gn==1?0x00DDFF:0x44FF44;
+                        gfx_rect(_cfx,_cfy+_cfh-1-_gn,_cfw,1,_gc);
+                    }
+                    gfx_print_scaled(_cfx+_cfw/2-80, _cfy+_cfh/2-12, 0xFFFFFF66, "CITY CAM", 2);
+                    gfx_print(_cfx+8, _cfy+_cfh-20, 0xFF00AA88, "VITEZA CITY 3D");
                 }
 
-                gfx_print(wx+24, wy+wh-30, 0x3A4A6A, "[Esc] close");
+                gfx_print(wx+16, wy+wh-24, 0x3A4A6A, "[Esc] close");
                 if (!k) { asm volatile("hlt"); continue; }
                 continue;
             }
@@ -2262,166 +2696,24 @@ redraw_desktop:
             // ─── Launchpad (win_type 15) ───
             if (win_type == 15) {
                 if (k == 27) { close_win(); search_focus = 1; goto redraw_desktop; }
-                if (k == KEY_UP && lp_sel_y > 0) { lp_sel_y--; continue; }
-                if (k == KEY_DOWN && lp_sel_y < 3) { lp_sel_y++; continue; }
-                if (k == KEY_UP && lp_sel_y == 0) { lp_sel_y = 3; continue; }
-                if (k == KEY_DOWN && lp_sel_y == 3) { lp_sel_y = 0; continue; }
-                if (k == KEY_LEFT && lp_sel_x > 0) { lp_sel_x--; continue; }
-                if (k == KEY_LEFT && lp_sel_x == 0) { lp_sel_x = 2; continue; }
-                if (k == KEY_RIGHT && lp_sel_x < 2) { lp_sel_x++; continue; }
-                if (k == KEY_RIGHT && lp_sel_x == 2) { lp_sel_x = 0; continue; }
+                if (k == KEY_UP && lp_sel_y > 0) { lp_sel_y--; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_DOWN && lp_sel_y < 2) { lp_sel_y++; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_UP && lp_sel_y == 0) { lp_sel_y = 2; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_DOWN && lp_sel_y == 2) { lp_sel_y = 0; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_LEFT && lp_sel_x > 0) { lp_sel_x--; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_LEFT && lp_sel_x == 0) { lp_sel_x = 3; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_RIGHT && lp_sel_x < 3) { lp_sel_x++; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
+                if (k == KEY_RIGHT && lp_sel_x == 3) { lp_sel_x = 0; draw_launch_pad(w, h, lp_sel_x, lp_sel_y); continue; }
                 if (k == '\n' || k == ' ') {
-                    int _la = lp_sel_y * 3 + lp_sel_x;
-                    if (_la < 12) {
-                        int _act = saction[_la];
+                    int _li = lp_sel_y * 4 + lp_sel_x;
+                    if (_li < 10) {
                         close_win(); search_focus = 1;
-                        // Open the selected app
-                        if (_act == 1) { open_app(1); draw_mac_title("This PC");
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,20,4,0x12124A);gfx_print(wx+24,wy+53,0x4A9EFF,"System Information");
-                            gfx_print(wx+24,wy+84,0x8A9ACE,"Kernel:    Viteza v1.0");
-                            gfx_print(wx+24,wy+102,0x8A9ACE,"CPU:       x86_64 Long Mode");
-                            gfx_print(wx+24,wy+120,0x8A9ACE,"RAM:       256 MB");
-                            char _dstr[32];_dstr[0]=0;
-                            _dstr[0]='0'+w/100%10;_dstr[1]='0'+w/10%10;_dstr[2]='0'+w%10;
-                            _dstr[3]='x';_dstr[4]='0'+h/100%10;_dstr[5]='0'+h/10%10;_dstr[6]='0'+h%10;_dstr[7]=0;
-                            gfx_print(wx+24,wy+138,0x8A9ACE,"Display:   ");gfx_print(wx+100,wy+138,0x00E5FF,_dstr);
-                            gfx_print(wx+24,wy+162,0x6A7A9E,"No drives detected");
-                            int _udc = usb_device_count();
-                            if (_udc > 0) { gfx_print(wx+24, wy+184, 0x4A9EFF, "USB Devices:");
-                                for (int _uj = 0; _uj < _udc && _uj < 2; _uj++) gfx_print(wx+24, wy+204+_uj*16, 0x6A8ABE, usb_device_name(_uj));
-                            } else { gfx_print(wx+24, wy+184, 0x6A7A9E, "No USB devices"); }
-                            gfx_print(wx+24,wy+240,0x3A4A6A,"[Esc] to close"); continue;
-                        }
-                        if (_act == 2) { open_app(2); draw_mac_title("Network");
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,20,4,0x12124A);gfx_print(wx+24,wy+53,0x4A9EFF,"Wi-Fi Status");
-                            gfx_print(wx+24,wy+84,0x8A9ACE,"SSID:     HOME-5G");
-                            gfx_print(wx+24,wy+102,0x8A9ACE,"Signal:   Excellent");
-                            gfx_print(wx+24,wy+120,0x8A9ACE,"Security: WPA2-PSK");
-                            gfx_print(wx+24,wy+144,0x6A7A9E,"IP: 0.0.0.0 (pending)");
-                            gfx_print(wx+24,wy+220,0x3A4A6A,"[Esc] to close"); continue;
-                        }
-                        if (_act == 3) { open_app(3); draw_mac_title("Terminal");
-                            term_line_count=0;term_scroll=0;
-                            term_add("[Viteza Terminal v1.0]",0);
-                            term_add("Type 'help' for commands.",0);
-                            term_redraw(); continue;
-                        }
-                        if (_act == 4) { open_app(4); draw_mac_title("System Settings");
-                            settings_redraw(); continue;
-                        }
-                        if (_act == 5) { open_app(5); draw_mac_title("OreoAI Assistant");
-                            chat_line_count=0;chat_scroll=0;chat_pos=0;
-                            chat_add("[OreoAI v1.0 - Ask me anything!]");
-                            chat_add("Try: hello, who are you, help");
-                            chat_redraw(); continue;
-                        }
-                        if (_act == 6) { open_app(6); draw_mac_title("Calculator");
-                            calc_val=0;calc_cur=0;calc_op=0;calc_state=0;
-                            calc_redraw(); continue;
-                        }
-                        if (_act == 7) { open_app(7); draw_mac_title("Notes");
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,20,4,0x12124A);gfx_print(wx+24,wy+53,0x4A9EFF,"My Notes");
-                            for(int _ni=0;_ni<note_count&&_ni<8;_ni++){
-                                char _ns[4];_ns[0]='0'+(_ni+1)%10;_ns[1]='.';_ns[2]=' ';_ns[3]=0;
-                                gfx_print(wx+20,wy+78+_ni*16,0x8899CC,_ns);
-                                char _nt[44];note_short(_ni,_nt);
-                                gfx_print(wx+40,wy+78+_ni*16,0x6A8ABE,_nt);
-                            }
-                            gfx_rect(wx+12,wy+210,ww-24,1,0x2A3A6A);
-                            gfx_print(wx+16,wy+218,0x4A6A8A,"> "); print_note_buf();
-                            gfx_print(wx+16,wy+248,0x3A4A6A,"[Enter] save  [Esc] back"); continue;
-                        }
-                        if (_act == 8) { open_app(8); draw_mac_title("App Store");
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,20,4,0x12124A);gfx_print(wx+24,wy+53,0x4A9EFF,"Available Apps");
-                            for(int _asi=0;_asi<APP_COUNT&&_asi<10;_asi++){
-                                int _asy=wy+78+_asi*20;
-                                gfx_fill_round_rect(wx+16,_asy-2,ww-32,18,3,app_colors[_asi]);gfx_rect(wx+16,_asy-2,4,18,app_colors[_asi]);
-                                gfx_print(wx+28,_asy+1,0xFFFFFF,app_names[_asi]);
-                                gfx_print(wx+180,_asy+1,0x8080AA,app_cats[_asi]);
-                                if(apps_installed[_asi]){gfx_print(wx+300,_asy+1,0x44FF44,"[Installed]");}
-                                else{gfx_print(wx+300,_asy+1,0x808080,"[ ");char _ak[2];_ak[0]='0'+_asi%10;_ak[1]=0;gfx_print(wx+312,_asy+1,0xFFAA00,_ak);gfx_print(wx+324,_asy+1,0x808080," ]");}
-                            }
-                            gfx_print(wx+16,wy+240,0x3A4A6A,"[0-9] install/uninstall  [Esc] back"); continue;
-                        }
-                        if (_act == 9) { open_app(9); draw_mac_title("Kairo Studio");
-                            studio_init_data(); studio_draw_all(); continue;
-                        }
-                        if (_act == 10) { open_app(10); draw_mac_title("KairoVM");
-                            vm_mode=0;
-                            gfx_fill_round_rect(wx+16,wy+50,ww-32,20,4,0x12124A);gfx_print(wx+24,wy+53,0xFF6644,"KairoVM - Virtual Machine Manager");
-                            if(vm_count==0){gfx_print(wx+60,wy+100,0x6A7A9E,"No virtual machines yet.");gfx_print(wx+60,wy+124,0x4A9EFF,"Press [c] to create one.");}
-                            else{
-                                gfx_print(wx+16,wy+76,0x8A8A9A,"Name                  OS                    RAM   CPUs  Disk  Status");
-                                gfx_rect(wx+16,wy+92,ww-32,1,0x2A2A4A);
-                                for(int _vi=0;_vi<vm_count&&_vi<4;_vi++){
-                                    int _vy=wy+96+_vi*40;
-                                    if(_vi==vm_sel){gfx_fill_round_rect(wx+14,_vy-2,ww-28,36,4,0x1A1A4A);}
-                                    char _vs[2];_vs[0]='0'+(_vi+1)%10;_vs[1]=0;
-                                    gfx_print(wx+20,_vy+2,0x8899CC,_vs);gfx_print(wx+40,_vy+2,0xFFFFFF,vm_name[_vi]);
-                                    gfx_print(wx+190,_vy+2,vm_os_color[vm_os[_vi]],vm_os_name[vm_os[_vi]]);
-                                    char _vr[8];int _ri=0,_rn=vm_ram[_vi];do{_vr[_ri++]='0'+_rn%10;_rn/=10;}while(_rn);_vr[_ri]=0;
-                                    for(int _rk=0;_rk<_ri/2;_rk++){char _rt=_vr[_rk];_vr[_rk]=_vr[_ri-1-_rk];_vr[_ri-1-_rk]=_rt;}
-                                    gfx_print(wx+310,_vy+2,0x88AACC,_vr);gfx_print(wx+336,_vy+2,0x6A7A9E,"MB");
-                                    char _vc[2];_vc[0]='0'+vm_cores[_vi]%10;_vc[1]=0;
-                                    gfx_print(wx+370,_vy+2,0x88AACC,_vc);
-                                    char _vd[8];int _di=0,_dn=vm_disk[_vi];do{_vd[_di++]='0'+_dn%10;_dn/=10;}while(_dn);_vd[_di]=0;
-                                    for(int _dk=0;_dk<_di/2;_dk++){char _dt=_vd[_dk];_vd[_dk]=_vd[_di-1-_dk];_vd[_di-1-_dk]=_dt;}
-                                    gfx_print(wx+400,_vy+2,0x88AACC,_vd);gfx_print(wx+420,_vy+2,0x6A7A9E,"GB");
-                                    if(vm_running[_vi]){gfx_print(wx+450,_vy+2,0x44FF44,"Running");}else{gfx_print(wx+450,_vy+2,0x808080,"Stopped");}
-                                }
-                                gfx_print(wx+16,wy+260,0x3A4A6A,"[Up/Down] select  [Enter] start/stop  [c] create  [d] delete");
-                            }
-                            continue;
-                        }
-                        if (_act == 11) { open_app(11); draw_mac_title("Camera");
-                            gfx_print(wx+16, wy+44, 0x4A9EFF, "Camera - Hardware Status"); continue;
-                        }
-                        if (_act == 12) { open_app(12); draw_mac_title("Kairo Player");
-                            gfx_fill_round_rect(wx+20, wy+48, ww-40, 130, 4, 0x000000);
-                            gfx_round_rect(wx+20, wy+48, ww-40, 130, 4, 0x3A5A8A);
-                            gfx_print(wx+28, wy+56, 0xFFFFFF, "Kairo Visual Engine");
-                            for (int _vy = 0; _vy < 100; _vy++) for (int _vx = 0; _vx < 320; _vx++) {
-                                int _vc = ((_vx * 5) ^ (_vy * 7)) & 0xFF;
-                                gfx_putpixel(wx+30 + _vx, wy+70 + _vy, (_vc<<16)|(_vc<<8)|_vc);
-                            }
-                            gfx_round_rect(wx+30, wy+70, 320, 100, 2, 0x4A6ADF);
-                            gfx_print(wx+ww-130, wy+155, 0x00E5FF, "Kairo Audio");
-                            gfx_print(wx+ww-130, wy+163, 0x3A5A8A, "Ready");
-                            gfx_print(wx+24, wy+196, 0x8A9ACE, "[P] Play  [S] Stop");
-                            gfx_print(wx+20, wy+wh-18, 0x3A4A6A, "Powered by Kairo Visual & Kairo Audio"); continue;
-                        }
+                        _launch_app(lpg_actions[_li]);
+                        continue;
                     }
                     continue;
                 }
-                // Redraw Launchpad
-                {   gfx_clear(0x000008);
-                    for(int _ly=0;_ly<h;_ly+=4){gfx_rect(0,_ly,w,2,0x080820);gfx_rect(0,_ly+2,w,1,0x0A0A30);}
-                    gfx_print_scaled(w/2-80, 20, 0x4488FF, "Launchpad", 2);
-                    gfx_print_scaled(w/2-24, 48, 0x3A5A8A, "Viteza OS", 1);
-                    const char _lpc[12] = {'P','#','>','*','A','+','N','$','{','V','C','~'};
-                    uint32_t _lpcols[12] = {0x3A6AFF,0x33BB33,0x3A3A4A,0x7A7A8A,0xAA77FF,0x3A8AEE,0xEE9900,0x3A77EE,0x5A4ABB,0xBB3333,0x55CCEE,0xBB3355};
-                    int _ic = 0;
-                    for(int _r=0;_r<4;_r++){for(int _c=0;_c<3;_c++){
-                        if(_ic>=12||_ic>=MAX_SEARCH)break;
-                        int _ix = w/2-160 + _c*110, _iy = 100 + _r*130;
-                        int _sel = (lp_sel_y==_r && lp_sel_x==_c);
-                        // shadow
-                        gfx_fill_round_rect(_ix+4, _iy+4, 80, 80, 16, 0x000008);
-                        // icon box
-                        gfx_fill_round_rect(_ix, _iy, 80, 80, 16, _lpcols[_ic]);
-                        // inner highlight
-                        gfx_fill_round_rect(_ix+4, _iy+4, 72, 72, 14, (_lpcols[_ic]&0xFEFEFE)>>1);
-                        if(_sel){gfx_round_rect(_ix-3, _iy-3, 86, 86, 18, 0xFFFFFF);gfx_round_rect(_ix-1, _iy-1, 82, 82, 16, 0x4488FF);}
-                        // icon character
-                        char _ich[2] = {_lpc[_ic],0};
-                        gfx_print_scaled(_ix+24, _iy+24, 0xFFFFFF, _ich, 4);
-                        // label
-                        int _ln = 0; while(sitems[_ic][_ln]) _ln++;
-                        gfx_print(_ix+40 - _ln*4, _iy+86, _sel?0xFFFFFF:0x8A9ACE, sitems[_ic]);
-                        _ic++;
-                    }}
-                    gfx_print(w/2-130, h-60, 0x3A4A6A, "[Arrows] navigate  [Enter] launch  [Esc] close");
-                }
+                draw_launch_pad(w, h, lp_sel_x, lp_sel_y);
                 if (!k) { asm volatile("hlt"); continue; }
                 continue;
             }
@@ -3045,6 +3337,360 @@ redraw_desktop:
                 continue;
             }
 
+            // ─── System Transfer (27) ───
+            if (win_type == 27) {
+                int st_close = 0;
+                handle_system_transfer_key(w, h, k, &st_close);
+                if (st_close) { close_win(); search_focus = 1; goto redraw_desktop; }
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Mic Test (29) — microphone level meter ───
+            if (win_type == 29) {
+                if (k == 27 || k == 'q') { ac97_stop_capture(); close_win(); search_focus = 1; goto redraw_desktop; }
+                int _mbw = 300, _mbh = 20, _mbx = w/2 - _mbw/2, _mby = h/2 - 40;
+                gfx_fill_round_rect(wx+16,wy+50,ww-32,wh-70,8,0x0E0E28);
+                gfx_print_scaled(wx+ww/2-60,wy+60,0x4488FF,"Mic Test",2);
+                int _lev = ac97_capture_is_active() ? ac97_capture_level() : 0;
+                // Simulate level when no real capture (demo mode)
+                if (!ac97_capture_is_active()) {
+                    _lev = ((_tick * 37 + (_tick/3)*19) % 30000);
+                    if (_lev > 25000) _lev = 30000 - (_lev-25000);
+                    if (_lev < 500) _lev = 500;
+                    gfx_print(wx+ww/2-80,_mby+50,0xFFAA44,"Demo mode (no capture)");
+                }
+                int _pct = _lev * 100 / 32768;
+                if (_pct > 100) _pct = 100;
+                gfx_rect(_mbx,_mby,_mbw,_mbh,0x1A1A3A);
+                gfx_rect(_mbx,_mby,_mbw*_pct/100,_mbh,_pct>70?0xFF4444:_pct>30?0xFFAA44:0x44CC44);
+                gfx_round_rect(_mbx,_mby,_mbw,_mbh,2,0x3A5A8A);
+                char _lb[8]; int _li=0,_ln=_pct; do{_lb[_li++]='0'+_ln%10;_ln/=10;}while(_ln);_lb[_li]='%';_lb[_li+1]=0;
+                for(int _lk=0;_lk<_li/2;_lk++){char _lt=_lb[_lk];_lb[_lk]=_lb[_li-1-_lk];_lb[_li-1-_lk]=_lt;}
+                gfx_print(w/2-16,_mby+_mbh+8,_pct>70?0xFF6666:0x88BBCC,_lb);
+                gfx_print(wx+16,wy+wh-24,0x3A4A6A,"[Esc] close");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Viteza Wii (28) — fullscreen Wii-style OS ───
+            if (win_type == 28) {
+                if (k == 27) { _wii_boot = 0; close_win(); search_focus = 1; goto redraw_desktop; }
+                // Draw fullscreen — covers the window frame entirely
+                if (_wii_boot) {
+                    // ─── Wii BIOS screen ───
+                    gfx_clear(0x000000);
+                    gfx_print_scaled(w/2-80, h/2-40, 0xFFFFFF, "VITEZA Wii", 4);
+                    gfx_print_scaled(w/2-90, h/2+30, 0x6688AA, "System BIOS v1.0", 1);
+                    // Loading bar
+                    int _lbx = w/2-120, _lby = h/2+70, _lbw = 240, _lbh = 8;
+                    gfx_rect(_lbx, _lby, _lbw, _lbh, 0x222222);
+                    gfx_rect(_lbx, _lby, (_lbw*((_tick*3)%100))/100, _lbh, 0x4488FF);
+                    gfx_print_scaled(w/2-90, h/2+90, 0x446688, "Press any key to continue", 1);
+                    if (k) { _wii_boot = 0; goto redraw_desktop; }
+                } else {
+                    // ─── Wii Menu fullscreen (macOS-quality UI) ───
+                    int _cols = 4, _rows = 3;
+                    int _ctw = (w-80)/_cols - 20, _cth = (h-100)/_rows - 20;
+                    int _mx2 = 40, _my2 = 60;
+                    const char *_wn[] = {"Snake","Pong⚡","Tetris","Maze 🗺️","Paint🎨","Camera3D","Terminal","Calc","Mic Test","Pomodoro","ASCII Art","Player"};
+                    const char *_wi[] = {"S","P","T","M","P","C","_","+","M","T","A","V"};
+                    uint32_t _wcol[] = {0x44CCAA,0xFF6644,0x44DDFF,0x44AA66,0xFF8844,0x66DDFF,0x00CC44,0x4A9EFF,0xBB88FF,0xFF8800,0xFFAA44,0xDD44AA};
+                    int _wa[] = {26,30,24,32,31,11,3,6,29,17,20,12};
+                    // Fullscreen gradient sky (Wii white → light blue)
+                    for (int _by = 0; _by < h; _by++) {
+                        int _bt = _by*255/h;
+                        int _br, _bg, _bb;
+                        if (_by < h/2) {
+                            _br = 235+_bt/30; _bg = 240+_bt/25; _bb = 248+_bt/20;
+                        } else {
+                            int _bh = _by-h/2; _bt = _bh*255/(h/2);
+                            _br = 235+_bt/30- _bt/20; _bg = 240+_bt/25; _bb = 248+_bt/8;
+                            if (_bb > 255) _bb = 255;
+                        }
+                        if (_br > 255) _br = 255; if (_bg > 255) _bg = 255;
+                        gfx_rect(0, _by, w, 1, (_br<<16)|(_bg<<8)|_bb);
+                    }
+                    // Clouds (soft white ellipses)
+                    gfx_fill_round_rect(w/4, h/3-10, w/5, h/12, 20, 0xFFFFFF44);
+                    gfx_fill_round_rect(w*3/5, h/4+10, w/6, h/14, 18, 0xFFFFFF44);
+                    gfx_fill_round_rect(w/3, h/2-20, w/7, h/16, 16, 0xFFFFFF33);
+                    // Top bar (glass)
+                    gfx_fill_round_rect(0, 0, w, 36, 8, 0xFFFFFFCC);
+                    gfx_rect(0, 36, w, 1, 0x00000022);
+                    gfx_print_scaled(14, 6, 0x003366, "Viteza Wii", 2);
+                    int _whr = 12, _wmn = 0; rtc_read(&_whr, &_wmn);
+                    char _wtbuf[8]; _wtbuf[0]='0'+_whr/10%10; _wtbuf[1]='0'+_whr%10; _wtbuf[2]=':'; _wtbuf[3]='0'+_wmn/10; _wtbuf[4]='0'+_wmn%10; _wtbuf[5]=0;
+                    gfx_print_scaled(w-140, 8, 0x446688, _wtbuf, 1);
+                    // Draw channel grid (macOS tiles with glass effect)
+                    static int _whov = -1;
+                    int _mx = mouse_get_x(), _my = mouse_get_y();
+                    _whov = -1;
+                    for (int _y = 0; _y < _rows; _y++) {
+                        for (int _x = 0; _x < _cols; _x++) {
+                            int _idx = _y*_cols+_x;
+                            int _cx = _mx2+_x*(_ctw+20), _cy = _my2+_y*(_cth+20);
+                            int _hov = (_mx >= _cx && _mx < _cx+_ctw && _my >= _cy && _my < _cy+_cth);
+                            if (_hov) _whov = _idx;
+                            // Shadow
+                            gfx_fill_round_rect(_cx+4,_cy+6,_ctw,_cth,14,0x00000022);
+                            // Tile body
+                            uint32_t _bg = _wcol[_idx];
+                            if (_hov) { _bg = ((_bg&0xFEFEFE)>>1)+0x555555; }
+                            gfx_fill_round_rect(_cx,_cy,_ctw,_cth,14,_bg);
+                            // Glass highlight
+                            gfx_fill_round_rect(_cx+4,_cy+3,_ctw-8,_cth/3,8,0xFFFFFF33);
+                            // Border glow on hover
+                            if (_hov) gfx_round_rect(_cx-1,_cy-1,_ctw+2,_cth+2,15,0xFFFFFF);
+                            else gfx_round_rect(_cx,_cy,_ctw,_cth,14,0x00000033);
+                            // Icon letter
+                            gfx_print_scaled(_cx+_ctw/2-12,_cy+_cth/2-30,0xFFFFFF,_wi[_idx],5);
+                            // App name
+                            int _wiy = _cy+_cth-28;
+                            gfx_fill_round_rect(_cx+4,_wiy-2,_ctw-8,22,4,0x00000044);
+                            gfx_print(_cx+_ctw/2-12,_wiy+2,_hov?0xFFFFFF:0xCCDDEE,_wn[_idx]);
+                        }
+                    }
+                    gfx_print(w/2-90, h-16, 0xFFFFFF88, "[Esc] back  [Click] launch");
+                    // Hand cursor override
+                    gfx_fill_round_rect(_mx,_my-4,8,12,2,0xFFFFFF);
+                    gfx_fill_round_rect(_mx+6,_my,6,10,2,0xFFFFFF);
+                    // Handle click to launch channel
+                    if (mouse_clicked() && _whov >= 0) {
+                        int _act = _wa[_whov];
+                        _wii_boot = 1;
+                        close_win(); search_focus = 1;
+                        _launch_app(_act);
+                        continue;
+                    }
+                }
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Pong ⚡ (30) — classic arcade ───
+            if (win_type == 30) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                int _pw = (ww-40)/2, _ph = wh-80;
+                int _pfx = wx+20, _pfx2 = wx+ww-20-8;
+                int _pby = wy+50, _pbh = _ph;
+                // Init
+                static int _pong_init = 0;
+                if (!_pong_init) {
+                    pong_py1 = _pby+_pbh/2-20; pong_py2 = _pby+_pbh/2-20;
+                    pong_bx = wx+ww/2; pong_by = _pby+_pbh/2;
+                    pong_bdx = 2; pong_bdy = 1; pong_s1 = 0; pong_s2 = 0;
+                    _pong_init = 1;
+                }
+                // AI left paddle + player right paddle
+                if (pong_bdx < 0 || (pong_bx < wx+ww/2)) {  // ball coming toward AI
+                    if (pong_py1+20 < pong_by-4 && pong_py1+40 < _pby+_pbh) pong_py1 += 4;
+                    if (pong_py1+20 > pong_by+4 && pong_py1 > _pby) pong_py1 -= 4;
+                } else {  // ball going away, return to center
+                    if (pong_py1+20 < _pby+_pbh/2-4) pong_py1 += 2;
+                    if (pong_py1+20 > _pby+_pbh/2+4) pong_py1 -= 2;
+                }
+                if (k == KEY_UP && pong_py2 > _pby) pong_py2 -= 6;
+                if (k == KEY_DOWN && pong_py2+40 < _pby+_pbh) pong_py2 += 6;
+                // Ball movement (every 3 ticks)
+                static int _pong_t = 0; _pong_t++;
+                if (_pong_t % 3 == 0) {
+                    pong_bx += pong_bdx; pong_by += pong_bdy;
+                    // Top/bottom bounce
+                    if (pong_by <= _pby || pong_by >= _pby+_pbh) pong_bdy = -pong_bdy;
+                    // Left paddle
+                    if (pong_bx <= _pfx+8 && pong_bx >= _pfx && pong_by >= pong_py1 && pong_by <= pong_py1+40) {
+                        pong_bdx = -pong_bdx;
+                        pong_bx = _pfx+9;
+                        pong_bdy = (pong_by - (pong_py1+20)) / 6;
+                        if (pong_bdy == 0) pong_bdy = 1;
+                    }
+                    // Right paddle
+                    if (pong_bx >= _pfx2-4 && pong_bx <= _pfx2+8 && pong_by >= pong_py2 && pong_by <= pong_py2+40) {
+                        pong_bdx = -pong_bdx;
+                        pong_bx = _pfx2-5;
+                        pong_bdy = (pong_by - (pong_py2+20)) / 6;
+                        if (pong_bdy == 0) pong_bdy = 1;
+                    }
+                    // Score
+                    if (pong_bx < _pfx-10) { pong_s2++; pong_bx = wx+ww/2; pong_by = _pby+_pbh/2; pong_bdx = -2; }
+                    if (pong_bx > _pfx2+20) { pong_s1++; pong_bx = wx+ww/2; pong_by = _pby+_pbh/2; pong_bdx = 2; }
+                }
+                // Draw
+                int _dmc = set_state & 1;
+                gfx_fill_round_rect(wx+12,wy+44,ww-24,wh-56,6,_dmc?0x03030E:0x08081C);
+                // Field
+                gfx_rect(_pfx,_pby,_pfx2-_pfx+8,_pbh,0x000000);
+                gfx_round_rect(_pfx-1,_pby-1,_pfx2-_pfx+10,_pbh+2,4,0x2A3A6A);
+                // Center line
+                for (int _l = 0; _l < _pbh; _l += 12) gfx_rect(wx+ww/2-1,_pby+_l,2,6,0x3A4A7A);
+                // Paddles
+                gfx_fill_round_rect(_pfx,pong_py1,8,40,4,0x44FF44);
+                gfx_fill_round_rect(_pfx2,pong_py2,8,40,4,0xFF4444);
+                // Ball
+                gfx_fill_round_rect(pong_bx-3,pong_by-3,6,6,3,0xFFFFFF);
+                // Score
+                char _ps1[4], _ps2[4];
+                _ps1[0]='0'+pong_s1; _ps1[1]=0; _ps2[0]='0'+pong_s2; _ps2[1]=0;
+                gfx_print_scaled(wx+ww/2-40, wy+50, 0x44FF44, _ps1, 3);
+                gfx_print_scaled(wx+ww/2+10, wy+50, 0xFF4444, _ps2, 3);
+                // Win
+                if (pong_s1 >= 5) { gfx_print_scaled(wx+ww/2-80, wy+160, 0x44FF44, "GREEN WINS!", 2); _pong_init = 0; }
+                if (pong_s2 >= 5) { gfx_print_scaled(wx+ww/2-80, wy+160, 0xFF4444, "RED WINS!", 2); _pong_init = 0; }
+                gfx_print(wx+16, wy+wh-24, 0x3A4A6A, "W/S  |  [Up]/[Down]  |  [Esc] exit");
+                // Christmas theme
+                if (_natal_mode) {
+                    for (int _pn = 0; _pn < 8; _pn++) {
+                        int _px = (_pn*177+53)%_pfx2;
+                        gfx_putpixel(_px, _pby+(_pn*311)%_pbh, 0xFF444444);
+                    }
+                }
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Paint 🎨 (31) — draw with mouse ───
+            if (win_type == 31) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                int _pcx = wx+12, _pcy = wy+48, _pcw = ww-24, _pch = wh-70;
+                int _csize = _pcw / _PW;
+                if (_csize * _PH > _pch) _csize = _pch / _PH;
+                if (_csize < 3) _csize = 3;
+                int _cw = _csize * _PW, _ch = _csize * _PH;
+                int _cox = _pcx + (_pcw - _cw)/2, _coy = _pcy + (_pch - _ch)/2;
+                // Init canvas
+                static int _pinit = 0;
+                if (!_pinit) {
+                    for (int _pi = 0; _pi < _PW*_PH; _pi++) _paint_cv[_pi] = 0xFFFFFF;
+                    _pinit = 1;
+                }
+                // Color palette
+                uint32_t _pals[] = {0xFF0000,0x00FF00,0x0000FF,0xFFFF00,0xFF8800,0xFF00FF,0x00FFFF,0x000000,0x888888,0xFFFFFF};
+                int _pal_y = wy+44, _pal_h = 10;
+                for (int _pi = 0; _pi < 10; _pi++) {
+                    gfx_rect(_pcx+_pi*28, _pal_y, 24, _pal_h, _pals[_pi]);
+                    if (_paint_col == _pals[_pi]) gfx_round_rect(_pcx+_pi*28-1, _pal_y-1, 26, _pal_h+2, 2, 0x000000);
+                }
+                // Size selector
+                if (k == '+' && _paint_size < 6) _paint_size++;
+                if (k == '-' && _paint_size > 1) _paint_size--;
+                char _psz[16]; _psz[0]='S';_psz[1]='z';_psz[2]=':';_psz[3]='0'+_paint_size;_psz[4]=0;
+                gfx_print(_pcx+300, _pal_y-2, 0x88AACC, _psz);
+                // Draw canvas
+                for (int _py = 0; _py < _PH; _py++) {
+                    for (int _px = 0; _px < _PW; _px++) {
+                        uint32_t _pc = _paint_cv[_py*_PW+_px];
+                        gfx_rect(_cox+_px*_csize, _coy+_py*_csize, _csize, _csize, _pc);
+                    }
+                }
+                gfx_round_rect(_cox-1, _coy-1, _cw+2, _ch+2, 2, 0x3A5A8A);
+                // Mouse drawing
+                int _mmx = mouse_get_x(), _mmy = mouse_get_y();
+                int _cix = (_mmx - _cox) / _csize, _ciy = (_mmy - _coy) / _csize;
+                if (_cix >= 0 && _cix < _PW && _ciy >= 0 && _ciy < _PH) {
+                    // Check color pick
+                    if (_mmy >= _pal_y && _mmy < _pal_y+_pal_h && _mmx >= _pcx && _mmx < _pcx+280) {
+                        int _picki = (_mmx - _pcx) / 28;
+                        if (_picki >= 0 && _picki < 10 && mouse_clicked()) _paint_col = _pals[_picki];
+                    } else if (mouse_clicked()) {
+                        // Draw circle
+                        for (int _dy = -_paint_size; _dy <= _paint_size; _dy++) {
+                            for (int _dx = -_paint_size; _dx <= _paint_size; _dx++) {
+                                if (_dx*_dx+_dy*_dy <= _paint_size*_paint_size) {
+                                    int _px = _cix+_dx, _py = _ciy+_dy;
+                                    if (_px >= 0 && _px < _PW && _py >= 0 && _py < _PH)
+                                        _paint_cv[_py*_PW+_px] = _paint_col;
+                                }
+                            }
+                        }
+                    }
+                    // Line from last point (smooth drawing)
+                    if (mouse_clicked() && _paint_lastx >= 0) {
+                        int _dx = _cix - _paint_lastx, _dy = _ciy - _paint_lasty;
+                        int _step = _dx > _dy ? _dx : _dy; if (_step < 0) _step = -_step;
+                        if (_step < 1) _step = 1;
+                        for (int _li = 1; _li <= _step; _li++) {
+                            int _lx = _paint_lastx + _dx*_li/_step;
+                            int _ly = _paint_lasty + _dy*_li/_step;
+                            for (int _dy2 = -_paint_size; _dy2 <= _paint_size; _dy2++) {
+                                for (int _dx2 = -_paint_size; _dx2 <= _paint_size; _dx2++) {
+                                    if (_dx2*_dx2+_dy2*_dy2 <= _paint_size*_paint_size) {
+                                        int _px2 = _lx+_dx2, _py2 = _ly+_dy2;
+                                        if (_px2 >= 0 && _px2 < _PW && _py2 >= 0 && _py2 < _PH)
+                                            _paint_cv[_py2*_PW+_px2] = _paint_col;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _paint_lastx = _cix; _paint_lasty = _ciy;
+                } else {
+                    _paint_lastx = -1;
+                }
+                // Clear button
+                if (k == 'c') {
+                    for (int _pi = 0; _pi < _PW*_PH; _pi++) _paint_cv[_pi] = 0xFFFFFF;
+                }
+                gfx_print(wx+16, wy+wh-22, 0x3A4A6A, "[C]lear  [+]/[-] size  [Esc] exit");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Maze 🗺️ (32) — navigate the labyrinth ───
+            if (win_type == 32) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                static int _maze_init = 0;
+                if (!_maze_init) {
+                    for (int _mi = 0; _mi < _MW*_MH; _mi++) _maze_map[_mi] = 1;
+                    _maze_map[1*_MW+1]=0;_maze_map[1*_MW+2]=0;_maze_map[1*_MW+3]=0;_maze_map[1*_MW+5]=0;_maze_map[1*_MW+6]=0;_maze_map[1*_MW+7]=0;_maze_map[1*_MW+8]=0;_maze_map[1*_MW+9]=0;_maze_map[1*_MW+11]=0;_maze_map[1*_MW+12]=0;_maze_map[1*_MW+13]=0;_maze_map[1*_MW+14]=0;
+                    _maze_map[2*_MW+1]=0;_maze_map[2*_MW+3]=0;_maze_map[2*_MW+5]=0;_maze_map[2*_MW+9]=0;_maze_map[2*_MW+11]=0;_maze_map[2*_MW+14]=0;
+                    _maze_map[3*_MW+1]=0;_maze_map[3*_MW+3]=0;_maze_map[3*_MW+4]=0;_maze_map[3*_MW+5]=0;_maze_map[3*_MW+6]=0;_maze_map[3*_MW+7]=0;_maze_map[3*_MW+9]=0;_maze_map[3*_MW+10]=0;_maze_map[3*_MW+11]=0;_maze_map[3*_MW+12]=0;_maze_map[3*_MW+14]=0;
+                    _maze_map[4*_MW+1]=0;_maze_map[4*_MW+3]=0;_maze_map[4*_MW+7]=0;_maze_map[4*_MW+11]=0;_maze_map[4*_MW+12]=0;_maze_map[4*_MW+13]=0;_maze_map[4*_MW+14]=0;
+                    _maze_map[5*_MW+1]=0;_maze_map[5*_MW+2]=0;_maze_map[5*_MW+3]=0;_maze_map[5*_MW+4]=0;_maze_map[5*_MW+5]=0;_maze_map[5*_MW+7]=0;_maze_map[5*_MW+8]=0;_maze_map[5*_MW+9]=0;_maze_map[5*_MW+10]=0;_maze_map[5*_MW+12]=0;_maze_map[5*_MW+13]=0;_maze_map[5*_MW+14]=0;
+                    _maze_map[7*_MW+1]=0;_maze_map[7*_MW+2]=0;_maze_map[7*_MW+3]=0;_maze_map[7*_MW+5]=0;_maze_map[7*_MW+6]=0;_maze_map[7*_MW+7]=0;_maze_map[7*_MW+8]=0;_maze_map[7*_MW+10]=0;_maze_map[7*_MW+11]=0;_maze_map[7*_MW+12]=0;_maze_map[7*_MW+13]=0;_maze_map[7*_MW+14]=0;
+                    _maze_map[8*_MW+1]=0;_maze_map[8*_MW+3]=0;_maze_map[8*_MW+7]=0;_maze_map[8*_MW+14]=0;
+                    _maze_map[9*_MW+1]=0;_maze_map[9*_MW+2]=0;_maze_map[9*_MW+3]=0;_maze_map[9*_MW+4]=0;_maze_map[9*_MW+5]=0;_maze_map[9*_MW+6]=0;_maze_map[9*_MW+7]=0;_maze_map[9*_MW+9]=0;_maze_map[9*_MW+10]=0;_maze_map[9*_MW+11]=0;_maze_map[9*_MW+12]=0;_maze_map[9*_MW+14]=0;
+                    _maze_map[10*_MW+5]=0;_maze_map[10*_MW+7]=0;_maze_map[10*_MW+8]=0;_maze_map[10*_MW+9]=0;_maze_map[10*_MW+11]=0;_maze_map[10*_MW+12]=0;_maze_map[10*_MW+14]=0;
+                    _maze_px = 1; _maze_py = 1; _maze_ex = 14; _maze_ey = 10; _maze_win = 0;
+                    _maze_init = 1;
+                }
+                // Movement
+                if (!_maze_win) {
+                    int _nx = _maze_px, _ny = _maze_py;
+                    if (k == KEY_UP) _ny--;
+                    if (k == KEY_DOWN) _ny++;
+                    if (k == KEY_LEFT) _nx--;
+                    if (k == KEY_RIGHT) _nx++;
+                    if (_nx >= 0 && _nx < _MW && _ny >= 0 && _ny < _MH && _maze_map[_ny*_MW+_nx] == 0) {
+                        _maze_px = _nx; _maze_py = _ny;
+                    }
+                    if (_maze_px == _maze_ex && _maze_py == _maze_ey) _maze_win = 1;
+                }
+                // Draw
+                int _mdm = set_state & 1;
+                gfx_fill_round_rect(wx+12,wy+44,ww-24,wh-56,6,_mdm?0x03030E:0x08081C);
+                int _mcw = (ww-60)/_MW, _mch = (wh-80)/_MH;
+                if (_mcw > _mch) _mcw = _mch; if (_mcw < 10) _mcw = 10;
+                int _mox = wx+(ww-_mcw*_MW)/2, _moy = wy+50+(wh-80-_mcw*_MH)/2;
+                for (int _my = 0; _my < _MH; _my++) {
+                    for (int _mx = 0; _mx < _MW; _mx++) {
+                        int _mc = _maze_map[_my*_MW+_mx];
+                        uint32_t _mcol = _mc ? 0x334488 : 0x111122;
+                        if (_mx == _maze_px && _my == _maze_py) _mcol = 0x44FF44;
+                        else if (_mx == _maze_ex && _my == _maze_ey) _mcol = 0xFFDD00;
+                        gfx_fill_round_rect(_mox+_mx*_mcw+1, _moy+_my*_mcw+1, _mcw-2, _mcw-2, 3, _mcol);
+                    }
+                }
+                if (_maze_win) {
+                    gfx_print_scaled(wx+ww/2-70, wy+wh/2-20, 0xFFDD00, "YOU WIN!", 3);
+                    gfx_print(wx+ww/2-50, wy+wh/2+20, 0x88AACC, "[R]estart  [Esc] exit");
+                    if (k == 'r') { _maze_init = 0; }
+                }
+                gfx_print(wx+16, wy+wh-22, 0x3A4A6A, "[Arrow] move  [R]estart  [Esc] exit");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
             if (!k) { asm volatile("hlt"); continue; }
             continue; // other windows: just wait for Esc
         }
@@ -3059,8 +3705,8 @@ redraw_desktop:
             int _mx = mouse_get_x(), _my = mouse_get_y();
             if (_my >= _di_y && _my < _di_y + _di_sz) {
                 int _di = (_mx - _di_base) / _di_sp;
-                if (_di >= 0 && _di < 9 && _mx >= _di_base + _di*_di_sp && _mx < _di_base + _di*_di_sp + _di_sz) {
-                    int acts[] = {25, 3, 4, 5, 6, 7, 8, 18, 24};
+                if (_di >= 0 && _di < 10 && _mx >= _di_base + _di*_di_sp && _mx < _di_base + _di*_di_sp + _di_sz) {
+                    int acts[] = {25, 3, 6, 32, 30, 31, 26, 24, 29, 28};
                     _launch_app(acts[_di]);
                     continue;
                 }
@@ -3226,29 +3872,15 @@ redraw_desktop:
         // Launchpad (L key)
         if (k == 'l' && !win && (!search_focus || search_pos == 0)) {
             win=1;win_type=15;lp_sel_x=0;lp_sel_y=0;
-            gfx_clear(0x000008);
-            for(int _ly=0;_ly<h;_ly+=4){gfx_rect(0,_ly,w,2,0x080820);gfx_rect(0,_ly+2,w,1,0x0A0A30);}
-            gfx_print_scaled(w/2-80, 20, 0x4488FF, "Launchpad", 2);
-            gfx_print_scaled(w/2-24, 48, 0x3A5A8A, "Viteza OS", 1);
-            const char _lpc[12] = {'P','#','>','*','A','+','N','$','{','V','C','~'};
-            uint32_t _lpcols[12] = {0x3A6AFF,0x33BB33,0x3A3A4A,0x7A7A8A,0xAA77FF,0x3A8AEE,0xEE9900,0x3A77EE,0x5A4ABB,0xBB3333,0x55CCEE,0xBB3355};
-            int _ic = 0;
-            for(int _r=0;_r<4;_r++){for(int _c=0;_c<3;_c++){
-                if(_ic>=12||_ic>=MAX_SEARCH)break;
-                int _ix = w/2-160 + _c*110, _iy = 100 + _r*130;
-                // shadow
-                gfx_fill_round_rect(_ix+4, _iy+4, 80, 80, 16, 0x000008);
-                // icon box
-                gfx_fill_round_rect(_ix, _iy, 80, 80, 16, _lpcols[_ic]);
-                gfx_fill_round_rect(_ix+4, _iy+4, 72, 72, 14, (_lpcols[_ic]&0xFEFEFE)>>1);
-                // icon character
-                char _ich[2] = {_lpc[_ic],0};
-                gfx_print_scaled(_ix+24, _iy+24, 0xFFFFFF, _ich, 4);
-                int _ln = 0; while(sitems[_ic][_ln]) _ln++;
-                gfx_print(_ix+40 - _ln*4, _iy+86, 0x8A9ACE, sitems[_ic]);
-                _ic++;
-            }}
-            gfx_print(w/2-130, h-60, 0x3A4A6A, "[Arrows] navigate  [Enter] launch  [Esc] close");
+            draw_launch_pad(w, h, lp_sel_x, lp_sel_y);
+            continue;
+        }
+
+        // System Transfer (T key)
+        if (k == 't' && !win && (!search_focus || search_pos == 0)) {
+            st_mode = ST_MENU; st_sel = 0;
+            win=1; win_type=27;
+            draw_system_transfer(w, h, &(int){0});
             continue;
         }
 
@@ -3352,6 +3984,27 @@ redraw_desktop:
         }
         if (k == 'k' && !win && (!search_focus || search_pos == 0)) { // Kairo Games
             open_app(25); draw_mac_title("Kairo Games");
+            continue;
+        }
+        if (k == 'z' && !win && (!search_focus || search_pos == 0)) { // Viteza Wii
+            open_app(28); _wii_boot = 1;
+            continue;
+        }
+        if (k == 'p' && !win && (!search_focus || search_pos == 0)) { // Pong
+            open_app(30); draw_mac_title("Pong ⚡");
+            continue;
+        }
+        if (k == 'b' && !win && (!search_focus || search_pos == 0)) { // Paint
+            open_app(31); draw_mac_title("Paint 🎨");
+            continue;
+        }
+        if (k == 'x' && !win && (!search_focus || search_pos == 0)) { // Maze
+            open_app(32); draw_mac_title("Maze 🗺️");
+            continue;
+        }
+        if (k == 'm' && !win && (!search_focus || search_pos == 0)) { // Mic Test
+            ac97_start_capture();
+            open_app(29);
             continue;
         }
 
@@ -3595,6 +4248,44 @@ redraw_desktop:
                 for(int __y=__dy-2;__y<__dy+__dh+4;__y++)gfx_rect(__dx-2,__y,sb_w+4,1,0x04040E);
                 if (match_count > 0) dropdown_draw(match,match_count,search_sel);
                 continue;
+            }
+        }
+        // Christmas overlay effects (snow over everything + Santa)
+        if (_natal_mode && win) {
+            // Snowflakes OVER windows
+            for (int _nf = 0; _nf < 32; _nf++) {
+                int _sx = (_natal_snow[_nf][0]*3+_natal_snow[_nf*2+1][1]*7)%w;
+                int _sy = (_natal_snow[_nf][1]*5+_nf*13)%h;
+                gfx_putpixel(_sx, _sy, 0xFFFFFF44);
+                gfx_putpixel(_sx, _sy+1, 0xFFFFFF44);
+            }
+            // Flying Santa
+            _santa_x += 2;
+            if (_santa_x > w + 80) _santa_x = -100;
+            _santa_f++;
+            // Sleigh body
+            gfx_fill_round_rect(_santa_x, _santa_y, 40, 12, 4, 0xCC2222);
+            gfx_fill_round_rect(_santa_x+2, _santa_y-3, 36, 6, 3, 0xDD4444);
+            gfx_rect(_santa_x+30, _santa_y-2, 8, 4, 0xAA1111);
+            // Santa in sleigh
+            gfx_fill_round_rect(_santa_x+10, _santa_y-14, 12, 12, 6, 0xFF4444); // body
+            gfx_fill_round_rect(_santa_x+12, _santa_y-20, 8, 8, 4, 0xFFDDCC); // head
+            gfx_fill_round_rect(_santa_x+11, _santa_y-16, 10, 4, 2, 0xFFFFFF); // beard
+            gfx_putpixel(_santa_x+14, _santa_y-18, 0x000000); // eye
+            gfx_fill_round_rect(_santa_x+12, _santa_y-22, 8, 3, 2, 0xFF2222); // hat
+            gfx_fill_round_rect(_santa_x+13, _santa_y-23, 6, 2, 1, 0xFFFFFF); // hat trim
+            // Reindeer
+            int _rdx = _santa_x - 10 + ((_santa_f/10)%2)*2;
+            gfx_fill_round_rect(_rdx, _santa_y-6, 14, 8, 4, 0x886644);
+            gfx_fill_round_rect(_rdx+10, _santa_y-14, 6, 10, 3, 0x886644); // head
+            gfx_fill_round_rect(_rdx+10, _santa_y-18, 2, 6, 1, 0x664422); // antler
+            gfx_fill_round_rect(_rdx+13, _santa_y-18, 2, 6, 1, 0x664422); // antler
+            gfx_putpixel(_rdx+14, _santa_y-10, 0xFF4444); // nose (Rudolph!)
+            // Sparkle trail
+            for (int _sp = 0; _sp < 6; _sp++) {
+                int _spx = _santa_x - _sp*6, _spy = _santa_y + 6 + (_sp%3)*2;
+                gfx_putpixel(_spx, _spy, 0xFFDD44 - _sp*0x222200);
+                gfx_putpixel(_spx, _spy+1, 0xFFDD44 - _sp*0x222200);
             }
         }
         asm volatile("hlt");

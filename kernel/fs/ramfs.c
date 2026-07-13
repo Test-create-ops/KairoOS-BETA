@@ -11,6 +11,11 @@ typedef struct {
 static ramfs_file_t ramfs_files[64];
 static int ramfs_count = 0;
 
+int ramfs_get_count(void) { return ramfs_count; }
+const char *ramfs_get_name(int i) { return (i >= 0 && i < ramfs_count) ? ramfs_files[i].name : 0; }
+unsigned long ramfs_get_size(int i) { return (i >= 0 && i < ramfs_count) ? ramfs_files[i].size : 0; }
+const unsigned char *ramfs_get_data(int i) { return (i >= 0 && i < ramfs_count) ? ramfs_files[i].data : 0; }
+
 const char *ramfs_read_file(const char *name)
 {
     for (int i = 0; i < ramfs_count; i++) {

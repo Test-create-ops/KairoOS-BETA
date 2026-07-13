@@ -18,7 +18,7 @@ MEM="256"
 VGA="std"
 KERNEL="kernel.bin"
 ISO="viteza.iso"
-AUDIO="-audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0"
+AUDIO="-audiodev coreaudio,id=audio0 -machine pcspk-audiodev=audio0 -device AC97,audiodev=audio0"
 
 # Find OVMF UEFI firmware
 OVMF=""
@@ -35,7 +35,7 @@ case "${1:-kernel}" in
     kernel)
         echo "Booting via -kernel (direct PVH entry)..."
         qemu-system-x86_64 -kernel "$KERNEL" -m "$MEM" -vga "$VGA" \
-            -machine "$MACH" -cpu "$CPU" $AUDIO \
+            -machine "$MACH" -cpu "$CPU" $AUDIO -rtc base=localtime \
             -serial tcp:localhost:9000,server,nowait \
             -display cocoa
         ;;

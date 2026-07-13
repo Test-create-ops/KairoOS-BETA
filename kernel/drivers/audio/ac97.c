@@ -14,14 +14,24 @@
 #define PO_CR       (PO_BASE + 0x0A)
 #define PO_BDBAR    (PO_BASE + 0x0C)
 
-// PO_CR bits
+// PCM In (capture) registers
+#define PI_BASE     0x20
+#define PI_CIV      (PI_BASE + 0x00)
+#define PI_LVI      (PI_BASE + 0x02)
+#define PI_SR       (PI_BASE + 0x04)
+#define PI_PICB     (PI_BASE + 0x06)
+#define PI_PIV      (PI_BASE + 0x08)
+#define PI_CR       (PI_BASE + 0x0A)
+#define PI_BDBAR    (PI_BASE + 0x0C)
+
+// PO/PI_CR bits
 #define CR_RPBM     0x01
 #define CR_RR       0x04
 #define CR_LVBIE    0x08
 #define CR_FEIE     0x10
 #define CR_IOCE     0x20
 
-// PO_SR bits
+// PO/PI_SR bits
 #define SR_DCH      0x01
 #define SR_BCIS     0x02
 #define SR_LVBCI    0x04
@@ -31,6 +41,9 @@
 #define MIX_RESET   0x00
 #define MIX_MASTER  0x02
 #define MIX_PCM     0x06
+#define MIX_MIC     0x0E
+#define MIX_REC_SELECT 0x1A
+#define MIX_REC_GAIN   0x1C
 #define MIX_RATE    0x2C
 
 // Buffer descriptor
@@ -294,4 +307,49 @@ void play_noise(uint32_t ms)
         speaker_tone(freq);
     }
     speaker_off();
+}
+
+// ─── Microphone Capture ───
+
+static int16_t capture_buf[SAMPLE_COUNT * 2] __attribute__((aligned(8)));
+static ac97_bd_t cap_bd_list[32] __attribute__((aligned(8)));
+static int capture_active = 0;
+
+void ac97_start_capture(void)
+{
+    if (!ac97_initialized) return;
+    outw(ac97_nabm + PI_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+    cap_bd_list[0].pointer = (uint32_t)(uintptr_t)capture_buf;
+    cap_bd_list[0].length = SAMPLE_COUNT * 4;
+    cap_bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PI_BDBAR, (uint32_t)(uintptr_t)cap_bd_list);
+    outw(ac97_nabm + PI_LVI, 0);
+    for (volatile int d = 0; d < 1000; d++);
+    outw(ac97_mixer + MIX_REC_SELECT, 0x0000);
+    outw(ac97_mixer + MIX_REC_GAIN, 0x0F0F);
+    outw(ac97_nabm + PI_CR, CR_RPBM);
+    capture_active = 1;
+}
+
+int ac97_capture_level(void)
+{
+    if (!capture_active) return 0;
+    int peak = 0, ns = 50;
+    if (ns > SAMPLE_COUNT) ns = SAMPLE_COUNT;
+    for (int i = 0; i < ns; i++) {
+        int s = capture_buf[i*2];
+        if (s < 0) s = -s;
+        if (s > peak) peak = s;
+    }
+    return peak;
+}
+
+int ac97_capture_is_active(void) { return capture_active; }
+
+void ac97_stop_capture(void)
+{
+    if (!capture_active) return;
+    outw(ac97_nabm + PI_CR, 0);
+    capture_active = 0;
 }
