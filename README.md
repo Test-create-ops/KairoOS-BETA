@@ -1,33 +1,45 @@
-# KairoOS-BETA
-Hobby OS for QEMU.
+# KairoOS
 
-Find the OS in **Master branch**
+![OS: x86-64](https://img.shields.io/badge/arch-x86__64-blue)
+![Boot: Multiboot2](https://img.shields.io/badge/boot-Multiboot2%2BPVH-green)
+![Lang: C](https://img.shields.io/badge/lang-C%2Basm-orange)
+![Status: Experimental](https://img.shields.io/badge/status-experimental-yellow)
+![GitHub last commit](https://img.shields.io/github/last-commit/Test-create-ops/KairoOS-BETA?color=purple)
+![GitHub repo size](https://img.shields.io/github/repo-size/Test-create-ops/KairoOS-BETA)
 
-# What's KairoOS?
+## Active Development
 
-Kairo os is a **Single Dev** OS made with passion by a Discord and Youtube Content Creator.
-Please help me by using it, I would appreciate it!
+The main development branch is **`master`**.
 
-**Thnak You**
+This repository hosts the **KairoOS Computer** kernel (x86-64 PC), not the **KairoTouch** mobile variant (ARM64).
 
-# HOW TO USE
+## Build
 
-To use KairoOS:
+```bash
+make
+bash iso/mkiso.sh
+```
 
-1. **Download the OS**: if it gives you a .zip file unzip it
-2. **Run .bat/.app**: its different if you are in an different OS, its buggy so dont get angry at me
-3. **use it in a VM**, the OS is still in beta, if you use it in real hardware and it doesn't work, just remember...**ITS NOT MY RESPONSIBILITY!**
-4. **Enjoy!**: why i wanted to say that? No reason **:)**
+## Run in QEMU
 
-# FAQ
+```bash
+# Direct boot (PVH)
+./boot.sh
 
-1. what is the IDE and computer you developed the OS on?
+# Boot from ISO (UEFI)
+./boot.sh iso
 
-This OS was made in **Visual Studio Code** with 300+ files.
-(the 200 remaining files are the build/test files)
-i first started making the os in Windows, the i switched to a Mac
+# Boot from ISO (Legacy BIOS)
+./boot.sh iso-bios
+```
 
-End.
+## What is KairoOS?
 
+KairoOS is a **single-developer** hobby OS made with passion. Boot it in QEMU or a VM and explore.
 
-# BYE !
+## Structure
+
+- `kernel/` — kernel sources (C, ASM)
+- `boot/` — boot stubs (GDT, IDT, loader)
+- `iso/` — ISO build scripts
+- `dist/` — distribution files
