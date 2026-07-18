@@ -94,6 +94,32 @@ def main():
                         f.flush()
                     f.write("END\n")
                     f.flush()
+                elif cmd.startswith("WEB|"):
+                    url = cmd[4:].strip()
+                    print(f"[proxy] Web fetch: {url}", file=sys.stderr)
+                    try:
+                        req = urllib.request.Request(url, headers={"User-Agent": "VitezaOS/1.0"})
+                        resp = urllib.request.urlopen(req, timeout=15)
+                        html = resp.read().decode("utf-8", errors="replace")
+                        # Strip HTML tags, return plain text
+                        import re
+                        text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+                        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+                        text = re.sub(r'<[^>]+>', ' ', text)
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        if len(text) > 2000:
+                            text = text[:2000] + "..."
+                        for rline in text.split('\n'):
+                            if rline.strip():
+                                safe = rline.replace('|', '/').strip()[:180]
+                                f.write(f"RESP|{safe}\n")
+                                f.flush()
+                    except Exception as e:
+                        print(f"[proxy] Web error: {e}", file=sys.stderr)
+                        f.write(f"RESP|[Error: {str(e)[:60]}]\n")
+                        f.flush()
+                    f.write("END\n")
+                    f.flush()
                 elif cmd.startswith("WTHR|"):
                     city = cmd[5:].strip()
                     print(f"[proxy] Weather request: {city}", file=sys.stderr)

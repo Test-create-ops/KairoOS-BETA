@@ -191,37 +191,116 @@ static const uint8_t font_stub[128][8] = {
     ['~'] = {0x00, 0x00, 0x00, 0x60, 0x92, 0x0C, 0x00, 0x00},
 };
 
+// Include anti-aliased font data (defines FONT_AA_W, FONT_AA_H, font_aa_data)
+#include "../../lib/font_aa.c"
+
+// Alpha-blend a pixel: blend src_color with alpha (0-15) onto bg
+static void gfx_putpixel_alpha(int x, int y, uint32_t color, int alpha)
+{
+    if (alpha <= 0 || x < 0 || y < 0 || x >= (int)fb.width || y >= (int)fb.height) return;
+    if (alpha >= 15) { gfx_putpixel(x, y, color); return; }
+    uint32_t *pixel = (uint32_t *)((uint8_t*)fb.framebuffer + y * fb.pitch + x * 4);
+    uint32_t bg = *pixel;
+    int sa = alpha;
+    int da = 15 - alpha;
+    int r = (((color >> 16) & 0xFF) * sa + ((bg >> 16) & 0xFF) * da) / 15;
+    int g = (((color >> 8) & 0xFF) * sa + ((bg >> 8) & 0xFF) * da) / 15;
+    int b = ((color & 0xFF) * sa + (bg & 0xFF) * da) / 15;
+    *pixel = (r << 16) | (g << 8) | b;
+}
+
+// Draw a semi-transparent rectangle (alpha 0-15)
+void gfx_rect_alpha(int x, int y, int w, int h, uint32_t color, int alpha)
+{
+    if (alpha >= 15) { gfx_rect(x, y, w, h, color); return; }
+    if (alpha <= 0) return;
+    for (int yy = y; yy < y + h; yy++)
+        for (int xx = x; xx < x + w; xx++)
+            gfx_putpixel_alpha(xx, yy, color, alpha);
+}
+
+// Box blur on a framebuffer region — uses temp buffer per row/column
+void gfx_blur_rect(int x, int y, int w, int h, int radius)
+{
+    if (w <= 0 || h <= 0 || radius <= 0) return;
+    for (int yy = y; yy < y + h; yy++) {
+        uint32_t row[2048];
+        int rw = w; if (rw > 2048) rw = 2048;
+        for (int xx = 0; xx < rw; xx++) row[xx] = gfx_getpixel(x + xx, yy);
+        for (int xx = 0; xx < rw; xx++) {
+            int rt = 0, gt = 0, bt = 0, cn = 0;
+            for (int d = -radius; d <= radius; d++) {
+                int ix = xx + d;
+                if (ix < 0 || ix >= rw) continue;
+                uint32_t p = row[ix];
+                rt += (p >> 16) & 0xFF; gt += (p >> 8) & 0xFF; bt += p & 0xFF;
+                cn++;
+            }
+            if (cn > 0) gfx_putpixel(x + xx, yy, ((rt/cn)<<16) | ((gt/cn)<<8) | (bt/cn));
+        }
+    }
+    for (int xx = x; xx < x + w; xx++) {
+        uint32_t col[256];
+        int rh = h; if (rh > 256) rh = 256;
+        for (int yy = 0; yy < rh; yy++) col[yy] = gfx_getpixel(xx, y + yy);
+        for (int yy = 0; yy < rh; yy++) {
+            int rt = 0, gt = 0, bt = 0, cn = 0;
+            for (int d = -radius; d <= radius; d++) {
+                int iy = yy + d;
+                if (iy < 0 || iy >= rh) continue;
+                uint32_t p = col[iy];
+                rt += (p >> 16) & 0xFF; gt += (p >> 8) & 0xFF; bt += p & 0xFF;
+                cn++;
+            }
+            if (cn > 0) gfx_putpixel(xx, y + yy, ((rt/cn)<<16) | ((gt/cn)<<8) | (bt/cn));
+        }
+    }
+}
+
 void gfx_print(int x, int y, uint32_t color, const char *text)
 {
     while (*text) {
         unsigned char c = (unsigned char)*text++;
-        if (c < 128) {
-            for (int r = 0; r < 8; r++) {
-                uint8_t row = font_stub[(int)c][r];
-                for (int col = 0; col < 8; col++) {
-                    if (row & (0x80 >> col)) {
+        if (c >= FONT_AA_FIRST && c <= FONT_AA_LAST) {
+            int idx = c - FONT_AA_FIRST;
+            const uint8_t *glyph = font_aa_data[idx];
+            for (int r = 0; r < FONT_AA_H; r++) {
+                uint8_t byte = glyph[r];
+                for (int col = 0; col < FONT_AA_W; col++) {
+                    if (byte & (1 << (7 - col)))
                         gfx_putpixel(x + col, y + r, color);
-                    }
                 }
             }
+            x += FONT_AA_W;
+        } else {
+            x += FONT_AA_W;
         }
-        x += 8;
     }
+}
+
+void gfx_print_shadow(int x, int y, uint32_t color, const char *text)
+{
+    gfx_print(x+1, y+1, 0x000008, text);
+    gfx_print(x, y, color, text);
 }
 
 void gfx_print_scaled(int x, int y, uint32_t color, const char *text, int scale)
 {
     while (*text) {
         unsigned char c = (unsigned char)*text++;
-        if (c >= 128) continue;
-        for (int r = 0; r < 8; r++) {
-            uint8_t row = font_stub[(int)c][r];
-            for (int col = 0; col < 8; col++) {
-                if (row & (0x80 >> col)) {
-                    gfx_rect(x + col*scale, y + r*scale, scale, scale, color);
+        if (c >= FONT_AA_FIRST && c <= FONT_AA_LAST) {
+            int idx = c - FONT_AA_FIRST;
+            const uint8_t *glyph = font_aa_data[idx];
+            for (int r = 0; r < FONT_AA_H; r++) {
+                uint8_t byte = glyph[r];
+                for (int col = 0; col < FONT_AA_W; col++) {
+                    if (byte & (1 << (7 - col)))
+                        gfx_rect(x + col*scale, y + r*scale, scale, scale, color);
                 }
             }
+            x += FONT_AA_W * scale;
+        } else {
+            x += FONT_AA_W * scale;
         }
-        x += 8 * scale;
     }
 }

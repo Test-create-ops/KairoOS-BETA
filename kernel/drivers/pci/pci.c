@@ -1,5 +1,8 @@
 #include "../../lib/io.h"
 
+#ifndef PCI_C
+#define PCI_C
+
 typedef struct {
     unsigned short vendor;
     unsigned short device;
@@ -53,3 +56,5 @@ void pci_scan() {
         }
     }
 }
+
+#endif

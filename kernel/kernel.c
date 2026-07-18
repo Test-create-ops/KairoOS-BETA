@@ -17,6 +17,8 @@
 #include "drivers/camera/camera.c"
 #include "drivers/bluetooth/bt.c"
 #include "drivers/audio/ac97.c"
+#include "drivers/net/rtl8139.c"
+#include "drivers/net/netstack.c"
 #include "scheduler/scheduler.c"
 #include "scheduler/process.c"
 #include "usermode/usermode.c"
@@ -46,6 +48,7 @@ void kernel_drivers(void) {
     mouse_init();
     pci_scan();
     ac97_init();
+    rtl8139_init();
 }
 
 void kernel_tasks(void) {
@@ -145,6 +148,8 @@ static void play_jingle_bells(void) {
     }
     speaker_off();
 }
+
+// Freq sweep — defined in ac97.c
 
 static void animate_bar(int x, int y, int w, int target) {
     for (int p = 0; p <= target; p += 4) {
@@ -305,11 +310,13 @@ void kernel_main(void) {
     char term_lines[60][80]; for (int _t=0;_t<60;_t++) term_lines[_t][0]=0;
     char chat_buf[128] = {0}; int chat_pos = 0, chat_line_count = 0, chat_scroll = 0;
     char chat_lines[60][80]; for (int _c=0;_c<60;_c++) chat_lines[_c][0]=0;
+    char br_url[128] = {0}; int br_pos = 0, br_line_count = 0, br_scroll = 0, br_fetching = 0;
+    char br_lines[60][80]; for (int _b=0;_b<60;_b++) br_lines[_b][0]=0;
     char notes[10][80]; int note_count = 0, note_sel = 0;
     char note_buf[80] = {0}; int note_pos = 0;
     int set_state = 0, set_cat = 0;
     int usb_popup = 0;
-    int apps_installed[26] = {1,1,1,1,1,0,0,0,1,0,0,0,1,0,1,0,1,1,0,0,0,0,0,0,0,0};
+    int apps_installed[27] = {1,1,1,1,1,0,0,0,1,0,0,0,1,0,1,0,1,1,0,0,0,0,0,0,0,0,1};
     int studio_panel = 0, studio_file = 0, studio_output_count = 0;
     const char *studio_fnames[3] = {"index.xml","index.js","style.css"};
     char code_buf[3][30][60]; int code_lines[3], code_cx[3], code_cy[3], code_scroll[3];
@@ -376,6 +383,8 @@ int _paint_col = 0xFF4444, _paint_lastx = -1, _paint_lasty = -1, _paint_size = 2
 #define _MW 16
 #define _MH 12
 int _maze_map[_MW*_MH], _maze_px=1, _maze_py=1, _maze_ex=14, _maze_ey=10, _maze_win=0;
+// Dino
+int _dino_y=0,_dino_v=0,_dino_obs=0,_dino_ox=0,_dino_score=0,_dino_dead=0,_dino_t=0;
 const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 LTS"};
     uint32_t vm_os_color[3] = {0x8888CC,0x4488FF,0xDD8844};
     gfx_print(80, 336, DIM, "TASKS");
@@ -636,8 +645,10 @@ redraw_desktop:
     // ─── Top menu bar (macOS style) ───
     int mby = 0, mbh = 24;
     dm = set_state & 1;
+    // Glass menu bar effect: blur + tint
+    gfx_blur_rect(0, mby, w, mbh, 6);
     if (_natal_mode) {
-        gfx_rect(0, mby, w, mbh, 0x0A0400);
+        gfx_rect_alpha(0, mby, w, mbh, 0x0A0400, 10);
         gfx_rect(0, mby+mbh-1, w, 1, 0x660000);
         gfx_fill_round_rect(7, 5, 12, 12, 6, 0x440000);
         gfx_fill_round_rect(7, 5, 12, 12, 6, 0xCC2222);
@@ -646,7 +657,7 @@ redraw_desktop:
         gfx_print(24, 5, 0xFF4444, "Viteza");
         gfx_print(w-200, 5, 0x44FF44, "🎄 BUON NATALE!");
     } else {
-        gfx_rect(0, mby, w, mbh, dm ? 0x06060E : 0x0A0A1C);
+        gfx_rect_alpha(0, mby, w, mbh, dm ? 0x06060E : 0x0A0A1C, 8);
         gfx_rect(0, mby+mbh-1, w, 1, dm ? 0x101020 : 0x1A1A3A);
         gfx_fill_round_rect(7, 5, 12, 12, 6, 0x000018);
         gfx_fill_round_rect(7, 5, 12, 12, 6, dm ? 0x2A4A8A : 0x3A6AFF);
@@ -656,8 +667,8 @@ redraw_desktop:
     }
     // App name when window is open
     _app_name = "Finder";
-    if(win && win_type > 0 && win_type < 33) {
-        switch(win_type){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="App Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break;
+    if(win && win_type > 0 && win_type < 37) {
+        switch(win_type){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="App Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break; case 33:_app_name="Music";break; case 34:_app_name="Dino";break; case 35:_app_name="Browser";break; case 36:_app_name="Chat";break;
         }
         gfx_rect(85, 6, 2, 12, dm ? 0x1A1A3A : 0x2A2A5A);
         gfx_print(92, 5, dm ? 0x8899CC : 0xAABBEE, _app_name);
@@ -760,8 +771,28 @@ redraw_desktop:
         gfx_round_rect(di_x,di_cy,di_sz,di_sz,10,_natal_mode?0xFF4444:0x4A6AAF);\
     } while(0)
 
-    // Kairo Games (0) — game controller icon
-    di_sh(0,0xCC44AA); {
+    // Dino (0) — green dinosaur
+    di_sh(0,0x44AA44); {
+        gfx_fill_round_rect(di_x+8,di_cy+12,24,18,4,0x227722);
+        gfx_fill_round_rect(di_x+12,di_cy+8,16,24,4,0x33CC33);
+        gfx_fill_round_rect(di_x+10,di_cy+20,20,4,2,0x44DD44);
+        gfx_putpixel(di_x+15,di_cy+12,0xFFFFFF);
+        gfx_putpixel(di_x+25,di_cy+12,0xFFFFFF);
+        gfx_fill_round_rect(di_x+6,di_cy+16,6,6,3,0x44DD44);
+        gfx_fill_round_rect(di_x+28,di_cy+16,6,6,3,0x44DD44);
+    }
+
+    // Music (1) — blue note
+    di_sh(1,0x4488FF); {
+        gfx_fill_round_rect(di_x+8,di_cy+8,24,24,6,0x6699FF);
+        gfx_print_scaled(di_x+14,di_cy+8,0xFFFFFF,"♪",3);
+        gfx_fill_round_rect(di_x+12,di_cy+22,16,6,3,0xFFFFFF);
+        gfx_rect(di_x+12,di_cy+20,4,10,0xFFFFFF);
+        gfx_rect(di_x+24,di_cy+20,4,10,0xFFFFFF);
+    }
+
+    // Kairo Games (2) — game controller icon
+    di_sh(2,0xCC44AA); {
         gfx_fill_round_rect(di_x+6,di_cy+12,28,16,6,0x221133);
         gfx_fill_round_rect(di_x+4,di_cy+16,32,8,4,0x661155);
         gfx_fill_round_rect(di_x+8,di_cy+14,8,6,3,0xFF66DD);
@@ -772,8 +803,8 @@ redraw_desktop:
         gfx_fill_round_rect(di_x+19,di_cy+28,2,4,1,0xAA3388);
     }
 
-    // Terminal (1) — real terminal window with buttons
-    di_sh(1,0x2A2A3A); {
+    // Terminal (3) — real terminal window with buttons
+    di_sh(3,0x2A2A3A); {
         gfx_fill_round_rect(di_x+5,di_cy+7,30,28,4,0x0A0A0A);
         gfx_fill_round_rect(di_x+7,di_cy+9,6,6,3,0xFF5A5A);
         gfx_fill_round_rect(di_x+15,di_cy+9,6,6,3,0xDDAA33);
@@ -783,15 +814,17 @@ redraw_desktop:
         gfx_rect(di_x+9,di_cy+27,10,2,0x00FF66);
     }
 
-    // Settings (2) — silver gear
-    di_sh(2,0x4A4A5A); {
-        gfx_fill_round_rect(di_x+16,di_cy+5,8,6,2,0x8A8A9A);
-        gfx_fill_round_rect(di_x+16,di_cy+29,8,6,2,0x8A8A9A);
-        gfx_fill_round_rect(di_x+5,di_cy+16,6,8,2,0x8A8A9A);
-        gfx_fill_round_rect(di_x+29,di_cy+16,6,8,2,0x8A8A9A);
-        gfx_fill_round_rect(di_x+9,di_cy+9,22,22,11,0x9A9AAA);
-        gfx_fill_round_rect(di_x+17,di_cy+17,6,6,3,0x4A4A5A);
-        gfx_rect(di_x+13,di_cy+11,6,1,0xCCCCDD);
+    // Calculator (4) — with display and buttons
+    di_sh(4,0x3A3A4A); {
+        gfx_fill_round_rect(di_x+8,di_cy+8,24,10,2,0x1A1A2A);
+        gfx_print(di_x+11,di_cy+9,0x44CC66,"0");
+        gfx_fill_round_rect(di_x+8,di_cy+20,7,7,2,0x5A5A6A);
+        gfx_fill_round_rect(di_x+17,di_cy+20,7,7,2,0x5A5A6A);
+        gfx_fill_round_rect(di_x+26,di_cy+20,7,7,2,0x5A5A6A);
+        gfx_fill_round_rect(di_x+8,di_cy+29,7,7,2,0x5A5A6A);
+        gfx_fill_round_rect(di_x+17,di_cy+29,7,7,2,0x5A5A6A);
+        gfx_fill_round_rect(di_x+26,di_cy+29,7,7,2,0x4A8AFF);
+        gfx_print(di_x+27,di_cy+30,0xFFFFFF,"=");
     }
 
     // OreoAI (3) — chat bubble with tail
@@ -858,11 +891,11 @@ redraw_desktop:
     int _active_di = -1;
     if(win){
         int _wt = win_type;
-        if(_wt==25)_active_di=0; else if(_wt==3)_active_di=1;
-        else if(_wt==4)_active_di=2; else if(_wt==5)_active_di=3;
-        else if(_wt==6)_active_di=4; else if(_wt==7)_active_di=5;
-        else if(_wt==8)_active_di=6; else if(_wt==18)_active_di=7;
-        else if(_wt==24)_active_di=8; else if(_wt==28)_active_di=9;
+        if(_wt==34)_active_di=0; else if(_wt==33)_active_di=1;
+        else if(_wt==25)_active_di=2; else if(_wt==3)_active_di=3;
+        else if(_wt==6)_active_di=4; else if(_wt==32)_active_di=5;
+        else if(_wt==30)_active_di=6; else if(_wt==31)_active_di=7;
+        else if(_wt==26)_active_di=8; else if(_wt==24)_active_di=9;
     }
     for (int _di = 0; _di < 10; _di++) {
         int _dot_x = di_base+_di*di_sp+16;
@@ -903,16 +936,44 @@ redraw_desktop:
     _td[5] = 0;
     gfx_print_scaled(dc_x2+16, dc_y2+8, 0x4488FF, _td, 2);
     gfx_print(dc_x2+12, dc_y2+44, 0x3A4A6A, "Viteza OS");
+    // Weather widget (below clock)
+    int _wwx = w - 170, _wwy = 160;
+    gfx_fill_round_rect(_wwx, _wwy, 140, 80, 8, 0x080820);
+    gfx_round_rect(_wwx, _wwy, 140, 80, 8, 0x2A3A6A);
+    gfx_print(_wwx+10, _wwy+6, 0x6688BB, "Meteo");
+    // Cloud icon
+    gfx_fill_round_rect(_wwx+16, _wwy+28, 40, 18, 9, 0x445577);
+    gfx_fill_round_rect(_wwx+26, _wwy+18, 20, 28, 10, 0x445577);
+    // Sun
+    gfx_fill_round_rect(_wwx+72, _wwy+20, 18, 18, 9, 0xFFCC44);
+    gfx_putpixel(_wwx+93, _wwy+18, 0xFFCC44);
+    gfx_putpixel(_wwx+93, _wwy+32, 0xFFCC44);
+    gfx_putpixel(_wwx+78, _wwy+14, 0xFFCC44);
+    gfx_putpixel(_wwx+88, _wwy+14, 0xFFCC44);
+    gfx_putpixel(_wwx+78, _wwy+38, 0xFFCC44);
+    gfx_putpixel(_wwx+88, _wwy+38, 0xFFCC44);
+    gfx_putpixel(_wwx+70, _wwy+20, 0xFFCC44);
+    gfx_putpixel(_wwx+70, _wwy+30, 0xFFCC44);
 
     // Search in top bar instead of dock
     int sb_x = w/2 - 120, sb_y = mbh+3, sb_w = 240, sb_h = 20;
     gfx_fill_round_rect(sb_x, sb_y, sb_w, sb_h, 10, 0x0A0A28);
     gfx_round_rect(sb_x, sb_y, sb_w, sb_h, 10, 0x2A3A6A);
-    gfx_print(sb_x+8, sb_y+2, 0x3A5A8A, "Search...");
+    gfx_print_shadow(sb_x+8, sb_y+2, 0x3A5A8A, "Search...");
+    // NIC status indicator
+    if (nic_ready) {
+        gfx_fill_round_rect(sb_x+sb_w+12, sb_y, 110, sb_h, 10, 0x082808);
+        gfx_round_rect(sb_x+sb_w+12, sb_y, 110, sb_h, 10, 0x2A5A2A);
+        gfx_print(sb_x+sb_w+16, sb_y+2, 0x44CC44, "NIC ready");
+    } else {
+        gfx_fill_round_rect(sb_x+sb_w+12, sb_y, 110, sb_h, 10, 0x280808);
+        gfx_round_rect(sb_x+sb_w+12, sb_y, 110, sb_h, 10, 0x5A2A2A);
+        gfx_print(sb_x+sb_w+16, sb_y+2, 0xCC4444, "NIC: none");
+    }
 
     // Keyboard shortcut bar (above dock)
     gfx_print(w/2-500, dc_y-18, 0x3A4A6A,
-        "[1]  [2]  [3]Term  [4]Set  [5]Oreo  [6]Calc  [7]Notes  [8]Store  [9]Studio  [0]VM  [E]Cal  [R]Pomo  [W]Wthr  [A]Art  [Y]Type  [O]Clip  [F]File  [G]Tet  [K]Games  [L]Lpad  [C]Cam  [V]Player  [U]USB  [Esc]");
+        "[1]  [2]  [3]Term  [4]Set  [5]Oreo  [6]Calc  [7]Notes  [8]Store  [9]Studio  [0]VM  [S]Music  [D]ino  [P]ong  [B]rush  [X]aze  [M]ic  [E]Cal  [R]Pomo  [W]Wthr  [A]Art  [Y]Type  [G]Tet  [K]Games  [Z]Wii  [Esc]");
 
     // Search focused by default
     search_focus = 1; int _tick = 0;
@@ -923,7 +984,7 @@ redraw_desktop:
         _time[0]='0'+_hr/10;_time[1]='0'+_hr%10;_time[2]=':';\
         _time[3]='0'+_mn/10;_time[4]='0'+_mn%10;_time[5]=0;\
         gfx_rect(_clk_x,5,55,12,0x0A0A1C);\
-        gfx_print(_clk_x,5,TEXT,_time);\
+        gfx_print_shadow(_clk_x,5,TEXT,_time);\
         /* Wi-Fi signal animation */\
         if(wifi_icon_x){\
             int _wsig = (_tick/6) % 5;\
@@ -941,7 +1002,7 @@ redraw_desktop:
             int _dmc = set_state & 1;\
             gfx_fill_round_rect(dc_x2,dc_y2,140,60,8,_dmc?0x040410:0x080820);\
             gfx_print_scaled(dc_x2+16,dc_y2+8,_dmc?0x3366CC:0x4488FF,_wd,2);\
-            gfx_print(dc_x2+12,dc_y2+44,_dmc?0x1A2A4A:0x3A4A6A,"Viteza OS");\
+            gfx_print_shadow(dc_x2+12,dc_y2+44,_dmc?0x1A2A4A:0x3A4A6A,"Viteza OS");\
         }\
         /* Desktop star twinkling */\
         if(!win && !cc_active && !nc_active){\
@@ -1034,31 +1095,34 @@ redraw_desktop:
         gfx_print(_sx+8,_sy+_sh-14,_dmc?0x18182A:0x2A3A5A,"[U/D] nav  [1-5] toggle  [Esc]");\
     } while(0)
 
-    #define MAX_SEARCH 24
-    const char *sitems[MAX_SEARCH] = {"This PC","Network","Terminal","Settings","OreoAI","Calculator","Notes","App Store","Kairo Studio","KairoVM","Camera","Kairo Player","True Video","Calendar","Pomodoro","Weather","Disk Usage","ASCII Art","Typing Test","Clipboard","File Manager","Tetris","Kairo Games","Snake"};
-    int saction[MAX_SEARCH] = {1,2,3,4,5,6,7,8,9,10,11,12,14,16,17,18,19,20,21,22,23,24,25,26};
+    #define MAX_SEARCH 25
+    const char *sitems[MAX_SEARCH] = {"This PC","Network","Terminal","Settings","OreoAI","Calculator","Notes","App Store","Kairo Studio","KairoVM","Camera","Kairo Player","True Video","Calendar","Pomodoro","Weather","Disk Usage","ASCII Art","Typing Test","Clipboard","File Manager","Tetris","Kairo Games","Snake","Web Browser"};
+    int saction[MAX_SEARCH] = {1,2,3,4,5,6,7,8,9,10,11,12,14,16,17,18,19,20,21,22,23,24,25,26,35};
 
-    #define APP_COUNT 25
+    #define APP_COUNT 26
     const char *app_names[APP_COUNT] = {
         "Kairo Studio","Terminal","Calculator","Notes","OreoAI",
         "File Manager","Image Viewer","Text Editor","Settings",
         "System Monitor","Code Compiler","Web Browser","Kairo Player",
         "Music Player","True Video","Clock","KairoVM","Camera",
-        "Calendar","Pomodoro","Weather","Disk Usage","ASCII Art","Typing Test","Tetris"
+        "Calendar","Pomodoro","Weather","Disk Usage","ASCII Art","Typing Test","Tetris",
+        "Net Browser"
     };
     const char *app_cats[APP_COUNT] = {
         "Development","System","Utilities","Productivity","AI",
         "System","Multimedia","Productivity","System",
         "System","Development","Internet","Multimedia",
         "Multimedia","Multimedia","Utilities","Virtualization","Multimedia",
-        "Productivity","Productivity","Utilities","System","Entertainment","Productivity","Game"
+        "Productivity","Productivity","Utilities","System","Entertainment","Productivity","Game",
+        "Internet"
     };
     uint32_t app_colors[APP_COUNT] = {
         0x6A5ACD,0x00CC44,0x4A9EFF,0xFFAA00,0xBB88FF,
         0x4A7AFF,0xFF8844,0x88AACC,0x8A8A9A,
         0x44CCAA,0xFF6644,0x44AAFF,0xCC4466,
         0xFF66AA,0xFF4444,0x88AACC,0xCC4444,0x66DDFF,
-        0xDD8844,0xFF5544,0x44CCDD,0x44FFAA,0xFF88CC,0x88CC44,0x44DDFF
+        0xDD8844,0xFF5544,0x44CCDD,0x44FFAA,0xFF88CC,0x88CC44,0x44DDFF,
+        0x44AAFF
     };
     // Clipboard app (stored separately)
 
@@ -1162,13 +1226,27 @@ redraw_desktop:
             snake_body[1][0]=4;snake_body[1][1]=9;\
             snake_body[2][0]=3;snake_body[2][1]=9;\
             snake_food_x=8;snake_food_y=8;\
+        }else if(_act==35){open_app(35);draw_mac_title("Net Browser");\
+            br_url[0]=0;br_pos=0;br_line_count=0;br_scroll=0;br_fetching=0;\
         }\
     } while(0)
 
     int wx=w/2-200, wy=h/2-160, ww=400, wh=280;
 
     // Helper to close window (restore macOS wallpaper background + stars)
-    #define close_win() do {\
+     #define close_win() do {\
+        /* Shrink animation — 3 steps to center */\
+        int _csizes[] = {ww, 180, 60};\
+        int _chgts[] = {wh, 120, 40};\
+        int _crads[] = {12, 8, 4};\
+        int _ccw = wx + ww/2, _cch = wy + wh/2;\
+        for (int _ci = 0; _ci < 3; _ci++) {\
+            int _cw2 = _csizes[_ci], _ch2 = _chgts[_ci];\
+            int _cx2 = _ccw - _cw2/2, _cy2 = _cch - _ch2/2;\
+            gfx_fill_round_rect(_cx2, _cy2, _cw2, _ch2, _crads[_ci], 0x0E0E28);\
+            gfx_round_rect(_cx2, _cy2, _cw2, _ch2, _crads[_ci], 0x3A5ADF);\
+            for (volatile int _cd = 0; _cd < 300000; _cd++);\
+        }\
         win=0;win_type=0;\
         int _cx1=wx,_cy1=wy,_cx2=wx+ww+8,_cy2=wy+wh+8;\
         int _dmc = set_state & 1;\
@@ -1244,7 +1322,7 @@ redraw_desktop:
             gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,0x2A0A0A);\
             gfx_rect(wx+8,wy+22,ww-16,12,0x1A0404);\
             gfx_rect(wx+4,wy+35,ww-8,1,0x660000);\
-            gfx_print(wx+ww/2-28,wy+7,0xFF6644,k_);\
+            gfx_print_shadow(wx+ww/2-28,wy+7,0xFF6644,k_);\
             gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xCC3333);\
             gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF6666);\
             gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
@@ -1259,7 +1337,7 @@ redraw_desktop:
             gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,_dmc?0x1A1A38:0x282852);\
             gfx_rect(wx+8,wy+22,ww-16,12,_dmc?0x141430:0x1E1E3E);\
             gfx_rect(wx+4,wy+35,ww-8,1,_dmc?0x24244A:0x3A3A6A);\
-            gfx_print(wx+ww/2-28,wy+7,_dmc?0x667799:0x8899CC,k_);\
+            gfx_print_shadow(wx+ww/2-28,wy+7,_dmc?0x667799:0x8899CC,k_);\
             gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xDD4A4A);\
             gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF7A7A);\
             gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
@@ -1272,10 +1350,23 @@ redraw_desktop:
         }\
     } while(0)
 
-    #define open_app(n) do {\
+     #define open_app(n) do {\
         win=1;win_type=n;\
+        int _dmc = set_state & 1;\
         /* Set app name for menu bar */\
-        switch(n){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break;\
+        switch(n){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break; case 33:_app_name="Music";break; case 34:_app_name="Dino";break; case 35:_app_name="Browser";break; case 36:_app_name="Chat";break;\
+        }\
+        /* Window expand animation — 4 steps from center */\
+        int _cw = wx + ww/2, _ch = wy + wh/2;\
+        int _asizes[] = {60, 120, 200, ww};\
+        int _ahgts[] = {40, 80, 140, wh};\
+        int _arads[] = {4, 6, 8, 12};\
+        for (int _ai = 0; _ai < 4; _ai++) {\
+            int _aw = _asizes[_ai], _ah = _ahgts[_ai];\
+            int _ax = _cw - _aw/2, _ay = _ch - _ah/2;\
+            gfx_fill_round_rect(_ax, _ay, _aw, _ah, _arads[_ai], 0x0E0E28);\
+            gfx_round_rect(_ax, _ay, _aw, _ah, _arads[_ai], 0x3A5ADF);\
+            for (volatile int _ad = 0; _ad < 300000; _ad++);\
         }\
         /* Outer shadow (wide, soft) */\
         gfx_fill_round_rect(wx+10,wy+12,ww,wh,12,0x000008);\
@@ -1291,10 +1382,9 @@ redraw_desktop:
         gfx_fill_round_rect(wx+2,wy+2,ww-4,14,10,0x141430);\
         gfx_rect(wx+4,wy+14,ww-8,2,0x0E0E28);\
         /* Update menu bar app name */\
-        int _dmc = set_state & 1;\
         gfx_rect(83,4,140,16,_dmc?0x06060E:0x0A0A1C);\
         gfx_rect(85,6,2,12,_dmc?0x1A1A3A:0x2A2A5A);\
-        gfx_print(92,5,_dmc?0x8899CC:0xAABBEE,_app_name);\
+        gfx_print_shadow(92,5,_dmc?0x8899CC:0xAABBEE,_app_name);\
     } while(0)
 
     // Add a wrapped terminal line (max 38 chars per line, properly multi-line)
@@ -1367,6 +1457,52 @@ redraw_desktop:
             if(_natal_mode&&_i==term_line_count-1&&term_lines[_i][0]==0xE2){_tc=0x44FF44;}\
             gfx_print(wx+16,_ty,_tc,term_lines[_i]); _ty+=16;\
         }\
+    } while(0)
+
+    // Add a wrapped browser content line (max 38 chars per line)
+    #define br_add(fmt) do {\
+        if(br_line_count<60){\
+            const char *_cp = fmt;\
+            while(*_cp && br_line_count<60){\
+                int _n; for(_n=0;_cp[_n];_n++);\
+                int _take = _n;\
+                if(_take > 38){\
+                    _take = 38; while(_take>0 && _cp[_take]!=' ')_take--;\
+                    if(_take<1)_take=38;\
+                }\
+                int _i; for(_i=0;_i<_take;_i++)br_lines[br_line_count][_i]=_cp[_i];\
+                br_lines[br_line_count][_i]=0;\
+                br_line_count++;\
+                _cp += _take;\
+                if(*_cp==' ')_cp++;\
+            }\
+            if(br_scroll==br_line_count-1||br_scroll==br_line_count-2)br_scroll=br_line_count-1;\
+            if(br_scroll>br_line_count-1)br_scroll=br_line_count-1;\
+        }\
+    } while(0)
+
+    #define br_redraw() do {\
+        int _bdm = set_state & 1;\
+        gfx_fill_round_rect(wx+8,wy+44,ww-16,wh-56,6,_bdm?0x03030E:0x08081C);\
+        gfx_round_rect(wx+8,wy+44,ww-16,wh-56,6,0x2A4A6A);\
+        int _ml = (wh-96)/16 - 1; if(_ml<1) _ml=1;\
+        int _start = br_scroll - _ml + 1; if(_start<0) _start=0;\
+        int _by = wy+72;\
+        for(int _i=_start; _i<=br_scroll && _i<br_line_count; _i++){\
+            char *_bl = br_lines[_i];\
+            uint32_t _bc = 0x88AACC;\
+            if(_bl[0]=='['){ _bc=0x8888CC; }\
+            else if(_bl[0]=='#'){ _bc=0xFFAA44; }\
+            gfx_print(wx+16,_by,_bc,_bl); _by+=16;\
+        }\
+        char _bb[80]; int _bi,_bn=0;\
+        char _bfx[]="URL> ";\
+        for(_bi=0;_bfx[_bi];_bi++)_bb[_bn++]=_bfx[_bi];\
+        for(_bi=0;_bi<br_pos&&_bi<44;_bi++)_bb[_bn++]=br_url[_bi];\
+        _bb[_bn]=0;\
+        gfx_fill_round_rect(wx+10,wy+48,ww-20,18,3,0x0A0A1A);\
+        gfx_print(wx+14,wy+49,0x44AAFF,_bb);\
+        if(br_fetching) gfx_print(wx+ww/2-30, wy+wh/2-8,0xFFAA44,"Loading...");\
     } while(0)
 
     // Redraw chat window — bubble-style
@@ -1485,14 +1621,15 @@ redraw_desktop:
     mouse_poll();
 
     // Debug: USB count + AC97 status
-    gfx_print(8, 4, 0x00FF00, "U:");
-    char _ud[8]; int _udi=7; _ud[_udi]=0; int _udn=usb_device_count(); do { _ud[--_udi]='0'+_udn%10; _udn/=10; } while(_udn); gfx_print(24, 4, 0x00FF00, _ud+_udi);
+    gfx_print_shadow(8, 4, 0x00FF00, "U:");
+    char _ud[8]; int _udi=7; _ud[_udi]=0; int _udn=usb_device_count(); do { _ud[--_udi]='0'+_udn%10; _udn/=10; } while(_udn); gfx_print_shadow(24, 4, 0x00FF00, _ud+_udi);
     extern int ac97_is_init(void);
-    gfx_print(48, 4, ac97_is_init() ? 0x00FF00 : 0xFF4444, ac97_is_init() ? "A:OK" : "A:NO");
+    gfx_print_shadow(48, 4, ac97_is_init() ? 0x00FF00 : 0xFF4444, ac97_is_init() ? "A:OK" : "A:NO");
 
     char k;
     while (1) {
         mouse_poll();
+        net_poll_all();
         draw_cursor();
         if (_natal_mode) {
             int _cmx = mouse_get_x(), _cmy = mouse_get_y();
@@ -1522,6 +1659,12 @@ redraw_desktop:
             uint32_t _mcols[] = {0xCC44AA,0x2A2A3A,0x4A4A5A,0x5A3A8A,0x3A3A4A,0xDDAA33,0x4488FF,0x6A8ABE,0x3A1A5A,0xFFFFFF};
             const char *_dinit[] = {"G","T","S","O","C","N","A","W","T","W"};
             const char *_dnm[] = {"Games","Terminal","Settings","OreoAI","Calculator","Notes","App Store","Weather","Tetris","Wii Menu"};
+            /* Glow ring behind magnified icon */
+            for (int _gi = 4; _gi > 0; _gi--) {
+                int _ga = 4 - _gi;
+                uint32_t _gl = (_ga*0x220000)|(_ga*0x002200)|(_ga*0x008800);
+                gfx_round_rect(_hx - 9 - _gi, _ddcy - 12 - _gi, 58 + _gi*2, 58 + _gi*2, 16 + _gi, _gl);
+            }
             int _msz = 54, _mx = _hx - 7, _my = _ddcy - 10;
             gfx_fill_round_rect(_mx+3, _my+3, _msz, _msz, 14, 0x000000);
             gfx_fill_round_rect(_mx, _my, _msz, _msz, 14, _mcols[_dhov]);
@@ -1532,7 +1675,7 @@ redraw_desktop:
             if (_dx < 4) _dx = 4; if (_dx + _dl*8 > w-4) _dx = w-4 - _dl*8;
             gfx_fill_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x0A0A2A);
             gfx_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x3A5A8A);
-            gfx_print(_dx, _my-22, 0xFFFFFF, _dn);
+            gfx_print_shadow(_dx, _my-22, 0xFFFFFF, _dn);
         }
         // Capture click BEFORE hover redraw so we don't lose it
         if (mouse_clicked() && !win && !cc_active && !nc_active && _dhov >= 0) {
@@ -1667,25 +1810,42 @@ _dock_go:
             static int dv_inited = 0;
             if (!dv_inited) { dv_x=32; dv_y=16; dv_dx=1; dv_dy=1; dv_c=0; dv_inited=1; }
             ss_frame++;
-            gfx_clear(0x000008);
-            // Draw some subtle grid lines for depth
-            for (int _gi = 0; _gi < w; _gi += 40) gfx_rect(_gi, 0, 1, h, 0x080818);
-            for (int _gj = 0; _gj < h; _gj += 40) gfx_rect(0, _gj, w, 1, 0x080818);
-            // Move the DVD logo
-            dv_x += dv_dx; dv_y += dv_dy;
-            int dv_w = 160, dv_h = 40;
-            if (dv_x <= 0 || dv_x + dv_w >= w) { dv_dx = -dv_dx; dv_c = (dv_c+1)%8; }
-            if (dv_y <= 0 || dv_y + dv_h >= h) { dv_dy = -dv_dy; dv_c = (dv_c+1)%8; }
-            // Clamp
-            if (dv_x < 0) dv_x = 0; if (dv_x + dv_w > w) dv_x = w - dv_w;
-            if (dv_y < 0) dv_y = 0; if (dv_y + dv_h > h) dv_y = h - dv_h;
-            uint32_t dv_color = dv_colors[dv_c];
-            // Draw logo with shadow
-            gfx_fill_round_rect(dv_x+3, dv_y+3, dv_w, dv_h, 10, 0x000000);
-            gfx_fill_round_rect(dv_x, dv_y, dv_w, dv_h, 10, dv_color);
-            gfx_round_rect(dv_x, dv_y, dv_w, dv_h, 10, 0xFFFFFF);
-            gfx_print_scaled(dv_x+20, dv_y+6, 0xFFFFFF, "DVD", 2);
-            gfx_print(dv_x+10, dv_y+26, 0x000000, "KAIRO  OS");
+            if (_natal_mode) {
+                gfx_clear(0x00081C);
+                for (int _si = 0; _si < 64; _si++) {
+                    static int _snx[64], _sny[64], _sni=0;
+                    if (!_sni) { _snx[_si]=_si*20+(_si*7)%w; _sny[_si]=(_si*13)%h; }
+                    _sny[_si] += 1 + (_si%3);
+                    if (_sny[_si] > h) { _sny[_si] = -10; _snx[_si] = (_si*37 + ss_frame*2) % w; }
+                    gfx_putpixel(_snx[_si], _sny[_si], 0xDDEEFF);
+                    gfx_putpixel(_snx[_si]+(_si%3)-1, _sny[_si]+1, 0xCCDDFF);
+                }
+                int _tx = w/2-20, _ty = h-120;
+                for (int _ti = 0; _ti < 10; _ti++) {
+                    int _tw = 60 - _ti*4;
+                    gfx_fill_round_rect(_tx-_tw/2+_ti*2, _ty+_ti*6, _tw, 8, 2, 0x007700+_ti*0x001100);
+                }
+                gfx_fill_round_rect(w/2-15, _ty-15, 30, 20, 4, 0xFFDD00);
+                gfx_rect(w/2-3, _ty-18, 6, 6, 0xFFFF44);
+                gfx_print_scaled(20, h-50, 0x44AA44, "BUON NATALE!", 3);
+                gfx_print_scaled(w-280, h-50, 0x4488FF, "❄", 4);
+            } else {
+                gfx_clear(0x000008);
+                for (int _gi = 0; _gi < w; _gi += 40) gfx_rect(_gi, 0, 1, h, 0x080818);
+                for (int _gj = 0; _gj < h; _gj += 40) gfx_rect(0, _gj, w, 1, 0x080818);
+                dv_x += dv_dx; dv_y += dv_dy;
+                int dv_w = 160, dv_h = 40;
+                if (dv_x <= 0 || dv_x + dv_w >= w) { dv_dx = -dv_dx; dv_c = (dv_c+1)%8; }
+                if (dv_y <= 0 || dv_y + dv_h >= h) { dv_dy = -dv_dy; dv_c = (dv_c+1)%8; }
+                if (dv_x < 0) dv_x = 0; if (dv_x + dv_w > w) dv_x = w - dv_w;
+                if (dv_y < 0) dv_y = 0; if (dv_y + dv_h > h) dv_y = h - dv_h;
+                uint32_t dv_color = dv_colors[dv_c];
+                gfx_fill_round_rect(dv_x+3, dv_y+3, dv_w, dv_h, 10, 0x000000);
+                gfx_fill_round_rect(dv_x, dv_y, dv_w, dv_h, 10, dv_color);
+                gfx_round_rect(dv_x, dv_y, dv_w, dv_h, 10, 0xFFFFFF);
+                gfx_print_scaled(dv_x+20, dv_y+6, 0xFFFFFF, "DVD", 2);
+                gfx_print(dv_x+10, dv_y+26, 0x000000, "KAIRO  OS");
+            }
             if (!k) { asm volatile("hlt"); continue; }
             continue;
         }
@@ -3393,10 +3553,10 @@ _dock_go:
                     int _cols = 4, _rows = 3;
                     int _ctw = (w-80)/_cols - 20, _cth = (h-100)/_rows - 20;
                     int _mx2 = 40, _my2 = 60;
-                    const char *_wn[] = {"Snake","Pong⚡","Tetris","Maze 🗺️","Paint🎨","Camera3D","Terminal","Calc","Mic Test","Pomodoro","ASCII Art","Player"};
-                    const char *_wi[] = {"S","P","T","M","P","C","_","+","M","T","A","V"};
-                    uint32_t _wcol[] = {0x44CCAA,0xFF6644,0x44DDFF,0x44AA66,0xFF8844,0x66DDFF,0x00CC44,0x4A9EFF,0xBB88FF,0xFF8800,0xFFAA44,0xDD44AA};
-                    int _wa[] = {26,30,24,32,31,11,3,6,29,17,20,12};
+                    const char *_wn[] = {"Dino🦖","Music 🎵","Snake🐍","Pong⚡","Tetris","Maze 🗺️","Paint🎨","Camera3D","Terminal","Mic Test","ASCII Art","Player"};
+                    const char *_wi[] = {"D","M","S","P","T","M","P","C","_","M","A","V"};
+                    uint32_t _wcol[] = {0x66DD88,0x4488FF,0x44CCAA,0xFF6644,0x44DDFF,0x44AA66,0xFF8844,0x66DDFF,0x00CC44,0xBB88FF,0xFFAA44,0xDD44AA};
+                    int _wa[] = {34,33,26,30,24,32,31,11,3,29,20,12};
                     // Fullscreen gradient sky (Wii white → light blue)
                     for (int _by = 0; _by < h; _by++) {
                         int _bt = _by*255/h;
@@ -3691,6 +3851,229 @@ _dock_go:
                 continue;
             }
 
+            // ─── Music Player 🎵 (33) — play melodies ───
+            if (win_type == 33) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                int _mdm = set_state & 1;
+                gfx_fill_round_rect(wx+12,wy+44,ww-24,wh-56,6,_mdm?0x03030E:0x08081C);
+                gfx_print_scaled(wx+ww/2-80, wy+56, 0x4488FF, "Music Player", 2);
+                gfx_rect(wx+20, wy+80, ww-40, 1, 0x2A3A6A);
+                // Song buttons
+                const char *_msongs[] = {"Jingle Bells","Startup","Sweep","Siren"};
+                int _mbtns[] = {0,1,2,3};
+                for (int _mi = 0; _mi < 4; _mi++) {
+                    int _mby = wy+94 + _mi*34;
+                    gfx_fill_round_rect(wx+30, _mby, ww-60, 28, 6, _mdm?0x0E0E2A:0x1A1A4A);
+                    gfx_round_rect(wx+30, _mby, ww-60, 28, 6, 0x3A5A8A);
+                    gfx_print_scaled(wx+50, _mby+4, 0x88BBFF, _msongs[_mi], 1);
+                    // Click to play
+                    int _mmx = mouse_get_x(), _mmy = mouse_get_y();
+                    if (mouse_clicked() && _mmx >= wx+30 && _mmx < wx+ww-30 && _mmy >= _mby && _mmy < _mby+28) {
+                        if (_mi == 0) play_jingle_bells();
+                        else if (_mi == 1) { speaker_tone(523); for(volatile int _d=0;_d<4000000;_d++); speaker_off(); }
+                        else if (_mi == 2) { play_sweep(200, 800, 500); }
+                        else if (_mi == 3) {
+                            for (int _si = 0; _si < 3; _si++) {
+                                speaker_tone(800); for(volatile int _d=0;_d<2000000;_d++);
+                                speaker_tone(600); for(volatile int _d=0;_d<2000000;_d++);
+                            }
+                            speaker_off();
+                        }
+                    }
+                }
+                // Status
+                gfx_print(wx+16, wy+wh-22, 0x3A4A6A, "Click a song  |  [Esc] exit");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Dino Runner 🦖 (34) — jump or die! ───
+            // ─── KMP Chat 💬 (36) — instant messaging ───
+            if (win_type == 36) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                int _kdm = set_state & 1;
+                gfx_fill_round_rect(wx+12,wy+44,ww-24,wh-56,6,_kdm?0x03030E:0x08081C);
+                gfx_print_scaled(wx+ww/2-70, wy+56, 0x4488FF, "Kairo Chat", 2);
+                gfx_rect(wx+20, wy+80, ww-40, 1, 0x2A3A6A);
+
+                // Chat message area
+                int _cay = wy+88, _cah = wh-160;
+                gfx_fill_round_rect(wx+16,_cay,ww-32,_cah,4,0x000008);
+                gfx_round_rect(wx+16,_cay,ww-32,_cah,4,0x1A2A4A);
+
+                // Status line
+                if (kmp_connected) {
+                    gfx_print(wx+20, _cay+4, 0x44CC44, "Connected");
+                    // Show received message
+                    static char _kmp_last[128];
+                    static int _kmp_had = 0;
+                    if (kmp_msg_ready) {
+                        char _tmp[128];
+                        if (kmp_poll(_tmp, 128) > 0) {
+                            int _ti = 0;
+                            while (_tmp[_ti] && _ti < 127) {
+                                _kmp_last[_ti] = _tmp[_ti];
+                                _ti++;
+                            }
+                            _kmp_last[_ti] = 0;
+                            _kmp_had = 1;
+                        }
+                    }
+                    if (_kmp_had) {
+                        gfx_print(wx+20, _cay+20, 0x88AACC, _kmp_last);
+                    } else {
+                        gfx_print(wx+20, _cay+20, 0x445577, "Waiting for messages...");
+                    }
+                } else {
+                    gfx_print(wx+20, _cay+4, 0xCC4444, "Disconnected");
+                }
+
+                // Buttons
+                int _kby = wy+wh-60;
+                if (!kmp_connected) {
+                    gfx_fill_round_rect(wx+30, _kby, 120, 28, 6, 0x1A3A1A);
+                    gfx_round_rect(wx+30, _kby, 120, 28, 6, 0x3A6A3A);
+                    gfx_print(wx+40, _kby+6, 0x44DD44, "Connect");
+                    int _mmx = mouse_get_x(), _mmy = mouse_get_y();
+                    if (mouse_clicked() && _mmx >= wx+30 && _mmx < wx+150 && _mmy >= _kby && _mmy < _kby+28) {
+                        kmp_connect();
+                    }
+                } else {
+                    gfx_fill_round_rect(wx+30, _kby, 120, 28, 6, 0x3A1A1A);
+                    gfx_round_rect(wx+30, _kby, 120, 28, 6, 0x6A3A3A);
+                    gfx_print(wx+36, _kby+6, 0xDD4444, "Disconnect");
+                    int _mmx = mouse_get_x(), _mmy = mouse_get_y();
+                    if (mouse_clicked() && _mmx >= wx+30 && _mmx < wx+150 && _mmy >= _kby && _mmy < _kby+28) {
+                        kmp_disconnect();
+                    }
+                    // Send "Hello" button
+                    gfx_fill_round_rect(wx+170, _kby, 120, 28, 6, 0x1A1A3A);
+                    gfx_round_rect(wx+170, _kby, 120, 28, 6, 0x3A3A6A);
+                    gfx_print(wx+186, _kby+6, 0x8888FF, "Say Hello");
+                    if (mouse_clicked() && _mmx >= wx+170 && _mmx < wx+290 && _mmy >= _kby && _mmy < _kby+28) {
+                        kmp_send_text("Hello from KairoOS!");
+                    }
+                }
+
+                gfx_print(wx+16, wy+wh-22, 0x3A4A6A, "[Esc] exit");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            if (win_type == 34) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                int _ddm = set_state & 1;
+                gfx_fill_round_rect(wx+12,wy+44,ww-24,wh-56,6,_ddm?0x03030E:0x08081C);
+                int _dgx = wx+20, _dgy = wy+80, _dgw = ww-40, _dgh = wh-120;
+                // Ground
+                int _gy = _dgy + _dgh - 20;
+                gfx_rect(_dgx, _gy, _dgw, 2, 0x44AA44);
+                for (int _gi = 0; _gi < _dgw; _gi += 8) {
+                    gfx_rect(_dgx+_gi, _gy+2, 4, 2, 0x338833);
+                }
+                static int _dino_init = 0;
+                if (!_dino_init) {
+                    _dino_y = 0; _dino_v = 0; _dino_obs = 0;
+                    _dino_ox = _dgw; _dino_score = 0; _dino_dead = 0; _dino_t = 0;
+                    _dino_init = 1;
+                }
+                if (!_dino_dead) {
+                    _dino_t++;
+                    // Gravity
+                    _dino_v += 1;
+                    _dino_y += _dino_v;
+                    if (_dino_y > 0) { _dino_y = 0; _dino_v = 0; }
+                    // Jump
+                    if ((k == ' ' || k == KEY_UP) && _dino_y == 0) { _dino_v = -10; }
+                    // Obstacle
+                    _dino_ox -= 3 + _dino_score/20;
+                    if (_dino_ox < -20) {
+                        _dino_ox = _dgw + (_dino_score*37%100);
+                        _dino_score++;
+                    }
+                    // Collision
+                    if (_dino_ox >= 30 && _dino_ox <= 50 && _dino_y >= -15) {
+                        _dino_dead = 1;
+                    }
+                }
+                // Draw dino
+                int _dy = _gy - 20 + _dino_y;
+                gfx_fill_round_rect(_dgx+30, _dy, 12, 16, 3, _dino_dead?0xFF4444:0x44DD44);
+                gfx_putpixel(_dgx+32, _dy+4, 0x000000);
+                gfx_fill_round_rect(_dgx+28, _dy+14, 16, 4, 2, _dino_dead?0xFF6666:0x66FF66);
+                // Draw cactus
+                if (_dino_ox >= 0) {
+                    gfx_fill_round_rect(_dgx+_dino_ox, _gy-16, 8, 16, 2, 0x338833);
+                    gfx_fill_round_rect(_dgx+_dino_ox-4, _gy-12, 16, 4, 2, 0x338833);
+                }
+                // Score
+                char _ds[16]; int _di=0, _dn=_dino_score;
+                do{_ds[_di++]='0'+_dn%10;_dn/=10;}while(_dn);_ds[_di]=0;
+                for(int _dk=0;_dk<_di/2;_dk++){char _dt=_ds[_dk];_ds[_dk]=_ds[_di-1-_dk];_ds[_di-1-_dk]=_dt;}
+                gfx_print_scaled(_dgx+_dgw-60, _dgy, 0x88AACC, _ds, 2);
+                if (_dino_dead) {
+                    gfx_print_scaled(_dgx+_dgw/2-70, _dgy+_dgh/2-20, 0xFF4444, "GAME OVER", 2);
+                    gfx_print(_dgx+_dgw/2-60, _dgy+_dgh/2+10, 0x88AACC, "[Space] restart  [Esc] exit");
+                    if (k == ' ') { _dino_init = 0; }
+                }
+                gfx_print(wx+16, wy+wh-22, 0x3A4A6A, "[Space/Up] jump  [Esc] exit");
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
+            // ─── Net Browser (35) ───
+            if (win_type == 35) {
+                if (k == 27 || k == 'q') { close_win(); search_focus = 1; goto redraw_desktop; }
+                if (k == KEY_UP && br_scroll > 0) { br_scroll--; br_redraw(); continue; }
+                if (k == KEY_DOWN && br_scroll < br_line_count-1) { br_scroll++; br_redraw(); continue; }
+                if (k == '\n') {
+                    br_url[br_pos] = 0;
+                    if (br_pos > 0) {
+                        br_fetching = 1;
+                        br_line_count = 0; br_scroll = 0;
+                        br_add("[Fetching...]");
+                        while (serial_available()) serial_read();
+                        serial_puts("WEB|");
+                        serial_puts(br_url);
+                        serial_write('\n');
+                        for (int _tw = 0; _tw < 30000; _tw++) {
+                            if (serial_available()) break;
+                            for (volatile int _d = 0; _d < 300000; _d++);
+                        }
+                        if (serial_available()) {
+                            char _rline[200];
+                            br_line_count = 0; br_scroll = 0;
+                            while (1) {
+                                int _ri = 0;
+                                while (_ri < 199) {
+                                    if (!serial_read_timeout(&_rline[_ri], 5000)) break;
+                                    if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;
+                                    _ri++;
+                                }
+                                _rline[_ri] = 0;
+                                if (_rline[0]=='E'&&_rline[1]=='N'&&_rline[2]=='D'&&_rline[3]==0) break;
+                                if (_rline[0]=='R'&&_rline[1]=='E'&&_rline[2]=='S'&&_rline[3]=='P'&&_rline[4]=='|') {
+                                    char *_rt = _rline + 5;
+                                    if (_rt[0]) br_add(_rt);
+                                }
+                            }
+                            if (br_line_count == 0) br_add("[No content returned]");
+                        } else {
+                            br_add("[Proxy not connected. Run: python3 social_proxy.py]");
+                        }
+                        br_fetching = 0;
+                    }
+                    br_pos = 0; br_url[0] = 0;
+                    br_redraw();
+                    continue;
+                }
+                if (k == '\b' && br_pos > 0) { br_pos--; br_url[br_pos] = 0; br_redraw(); continue; }
+                if (br_pos < 127 && k >= ' ' && k <= '~') { br_url[br_pos++] = k; br_url[br_pos] = 0; br_redraw(); continue; }
+                br_redraw();
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
             if (!k) { asm volatile("hlt"); continue; }
             continue; // other windows: just wait for Esc
         }
@@ -3706,7 +4089,14 @@ _dock_go:
             if (_my >= _di_y && _my < _di_y + _di_sz) {
                 int _di = (_mx - _di_base) / _di_sp;
                 if (_di >= 0 && _di < 10 && _mx >= _di_base + _di*_di_sp && _mx < _di_base + _di*_di_sp + _di_sz) {
-                    int acts[] = {25, 3, 6, 32, 30, 31, 26, 24, 29, 28};
+                    int acts[] = {34, 33, 25, 3, 6, 32, 30, 31, 26, 24};
+                    /* Dock bounce animation */
+                    int _bounce_colors[] = {0x44AA44,0x4488FF,0xCC44AA,0x2A2A3A,0x3A3A4A,0xDDAA33,0x4488FF,0x6A8ABE,0x3A1A5A,0xFFFFFF};
+                    int _bx = _di_base + _di*_di_sp, _by = _di_y;
+                    gfx_fill_round_rect(_bx-4, _by-4, _di_sz+8, _di_sz+8, 14, 0x000000);
+                    gfx_fill_round_rect(_bx-2, _by-2, _di_sz+4, _di_sz+4, 12, _bounce_colors[_di]);
+                    gfx_round_rect(_bx-2, _by-2, _di_sz+4, _di_sz+4, 12, 0x88BBFF);
+                    for (volatile int _bd = 0; _bd < 200000; _bd++);
                     _launch_app(acts[_di]);
                     continue;
                 }
@@ -4005,6 +4395,18 @@ _dock_go:
         if (k == 'm' && !win && (!search_focus || search_pos == 0)) { // Mic Test
             ac97_start_capture();
             open_app(29);
+            continue;
+        }
+        if (k == 's' && !win && (!search_focus || search_pos == 0)) { // Music Player
+            open_app(33); draw_mac_title("Music Player 🎵");
+            continue;
+        }
+        if (k == 'd' && !win && (!search_focus || search_pos == 0)) { // Dino Runner
+            open_app(34); draw_mac_title("Dino Runner 🦖");
+            continue;
+        }
+        if (k == 'h' && !win && (!search_focus || search_pos == 0)) { // Chat
+            open_app(36); draw_mac_title("Kairo Chat 💬");
             continue;
         }
 

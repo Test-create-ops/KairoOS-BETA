@@ -36,6 +36,8 @@ case "${1:-kernel}" in
         echo "Booting via -kernel (direct PVH entry)..."
         qemu-system-x86_64 -kernel "$KERNEL" -m "$MEM" -vga "$VGA" \
             -machine "$MACH" -cpu "$CPU" $AUDIO -rtc base=localtime \
+            -netdev user,id=net0,hostfwd=tcp::2525-:25,hostfwd=tcp::9999-:9999 \
+            -device rtl8139,netdev=net0,mac=52:54:00:12:34:56 \
             -serial tcp:localhost:9000,server,nowait \
             -display cocoa
         ;;

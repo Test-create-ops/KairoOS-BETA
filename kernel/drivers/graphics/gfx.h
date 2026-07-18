@@ -20,8 +20,11 @@ void gfx_fillrect(int x, int y, int w, int h, uint32_t color);
 void gfx_round_rect(int x, int y, int w, int h, int r, uint32_t color);
 void gfx_fill_round_rect(int x, int y, int w, int h, int r, uint32_t color);
 void gfx_print(int x, int y, uint32_t color, const char *text);
+void gfx_print_shadow(int x, int y, uint32_t color, const char *text);
 void gfx_print_scaled(int x, int y, uint32_t color, const char *text, int scale);
 void gfx_drawtext(int x, int y, uint32_t color, const char *text);
+void gfx_rect_alpha(int x, int y, int w, int h, uint32_t color, int alpha);
+void gfx_blur_rect(int x, int y, int w, int h, int radius);
 int gfx_width(void);
 int gfx_height(void);
 
