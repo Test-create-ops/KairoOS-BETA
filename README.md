@@ -7,11 +7,11 @@
 ![GitHub last commit](https://img.shields.io/github/last-commit/Test-create-ops/KairoOS-BETA?color=purple)
 ![GitHub repo size](https://img.shields.io/github/repo-size/Test-create-ops/KairoOS-BETA)
 
-## Sviluppo attivo
+## Active Development
 
-Il branch principale di sviluppo è **`master`**.
+The main development branch is **`master`**.
 
-Questo repository ospita il codice del kernel **KairoOS Computer** (x86-64 PC), non la variante mobile **KairoTouch** (ARM64).
+This repository hosts the **KairoOS Computer** kernel (x86-64 PC), not the **KairoTouch** mobile variant (ARM64).
 
 ## Build
 
@@ -20,22 +20,22 @@ make
 bash iso/mkiso.sh
 ```
 
-## Avvio in QEMU
+## Run in QEMU
 
 ```bash
-# Avvio diretto (PVH)
+# Direct boot (PVH)
 ./boot.sh
 
-# Avvio da ISO (UEFI)
+# Boot from ISO (UEFI)
 ./boot.sh iso
 
-# Avvio da ISO (Legacy BIOS)
+# Boot from ISO (Legacy BIOS)
 ./boot.sh iso-bios
 ```
 
-## Struttura
+## Structure
 
-- `kernel/` — sorgenti del kernel (C, ASM)
-- `boot/` — stubs di boot (GDT, IDT, loader)
-- `iso/` — script per generare ISO
-- `dist/` — distribuzione
+- `kernel/` — kernel sources (C, ASM)
+- `boot/` — boot stubs (GDT, IDT, loader)
+- `iso/` — ISO build scripts
+- `dist/` — distribution files
