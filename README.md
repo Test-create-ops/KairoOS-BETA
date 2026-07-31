@@ -9,9 +9,9 @@
 
 ## Preview
 
-![KairoOS desktop concept](docs/kairo-preview.png)
+![KairoOS in esecuzione su QEMU](docs/kairo-screenshot.png)
 
-*Concept dell'interfaccia (mockup), non uno screenshot reale del sistema in esecuzione.*
+*KairoOS avviato su QEMU (UEFI/OVMF).*
 
 ## Active Development
 
