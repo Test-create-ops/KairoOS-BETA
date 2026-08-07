@@ -7,3 +7,6 @@ __pycache__/
 stt_apple
 stt_apple.app/
 *.app/
+
+# Windows app build artifacts
+tools/winapp/out/
