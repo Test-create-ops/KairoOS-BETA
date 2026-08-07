@@ -187,7 +187,7 @@ init_page_tables:
 
     mov edi, pd
     mov eax, 0x000083
-    mov ecx, 2
+    mov ecx, 4
 .1:
     mov dword [edi], eax
     mov dword [edi + 4], 0

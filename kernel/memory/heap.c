@@ -1,8 +1,7 @@
 #include "heap.h"
 #include "paging.h"
 
-#define HEAP_PHYS_START 0x190000
-#define HEAP_INITIAL_SIZE (1024 * 1024)
+extern char _end[];
 
 typedef struct block_header {
     size_t size;
@@ -14,7 +13,8 @@ static block_header_t *heap_head = NULL;
 
 void kheap_init(void)
 {
-    heap_head = (block_header_t *)HEAP_PHYS_START;
+    uint64_t start = ((uint64_t)_end + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    heap_head = (block_header_t *)start;
     heap_head->size = HEAP_INITIAL_SIZE - sizeof(block_header_t);
     heap_head->free = 1;
     heap_head->next = NULL;

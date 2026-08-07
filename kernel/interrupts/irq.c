@@ -13,7 +13,7 @@ static void pic_remap(void)
     outb(0x21, 0x01);
     outb(0xA1, 0x01);
     outb(0x21, 0xFC);  // unmask IRQ0 (timer) + IRQ1 (keyboard)
-    outb(0xA1, 0xFF);  // mask all slave IRQs (mouse handled via polling)
+    outb(0xA1, 0xEF);  // unmask IRQ12 (PS/2 mouse), mask the rest
 }
 
 void irq_init(void)

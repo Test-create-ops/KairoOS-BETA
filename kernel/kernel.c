@@ -2,6 +2,9 @@
 #include "lib/io.h"
 #include "lib/framebuffer.c"
 
+static void serial_puts(const char *s);
+static void serial_dec(int v);
+
 #include "gdt/gdt.c"
 #include "tss/tss.c"
 #include "idt/idt.c"
@@ -11,19 +14,58 @@
 #include "memory/heap.c"
 #include "memory/mmu.c"
 #include "drivers/graphics/gfx.c"
+#include "drivers/graphics/render3d.h"
+#include "../ui/renderer/renderer.c"
+#include "../ui/windows/window.c"
 #include "drivers/mouse/mouse.c"
 #include "drivers/keyboard/keyboard.c"
 #include "drivers/usb/usb.c"
 #include "drivers/camera/camera.c"
 #include "drivers/bluetooth/bt.c"
 #include "drivers/audio/ac97.c"
+#include "drivers/audio/stt.c"
 #include "drivers/net/rtl8139.c"
 #include "drivers/net/netstack.c"
+#include "drivers/ahci/ahci.c"
 #include "scheduler/scheduler.c"
 #include "scheduler/process.c"
 #include "usermode/usermode.c"
+#include "syscall/syscall.c"
 #include "boot_screen.c"
 #include "launch_pad.c"
+
+// Buffer per il fallback STT: mono 16k, max 5s (invio seriale al proxy)
+static int16_t stt_tmp_mono[80000];
+
+// Nuova UI: finestre gestite da window_t (ui/windows/window.c) e chrome
+// disegnato dal renderer font8x8 (ui/renderer/renderer.c)
+static int wx, wy, ww, wh;
+static window_t g_win;
+static const char *g_win_title = 0;
+static int g_win_init = 0;
+
+// Kernel context saved before launching a ring3 program; sys_exit
+// restores it via kernel_longjmp so kernel_main resumes into the GUI.
+extern int kernel_setjmp(unsigned long ctx[8]);
+extern void kernel_longjmp(const unsigned long ctx[8]);
+static unsigned long kctx[8];
+
+// String utilities (needed by VFS, ELF, etc.)
+#include "utils/string.c"
+#include "lib/string.c"
+#include "lib/memory.c"
+
+// Process abstraction (user-space processes, used by ELF loader)
+#include "proc/proc.c"
+
+// File System
+#include "fs/vfs.c"
+#include "fs/ramfs.c"
+#include "fs/kfs.c"
+#include "initrd/initrd.c"
+
+// ELF program loader
+#include "elf/elf.c"
 
 
 
@@ -39,7 +81,7 @@ void kernel_early(void) {
 void kernel_memory(uint32_t fb_addr) {
     paging_init(fb_addr);
     paging_enable();
-    mmu_init();
+    mmu_init(fb_addr);
     kheap_init();
 }
 
@@ -49,6 +91,7 @@ void kernel_drivers(void) {
     pci_scan();
     ac97_init();
     rtl8139_init();
+    ahci_init();
 }
 
 void kernel_tasks(void) {
@@ -97,9 +140,47 @@ static void rtc_read_date(int *m, int *d) {
     else { *m = ((vm>>4)*10)+(vm&0x0F); *d = ((vd>>4)*10)+(vd&0x0F); }
 }
 
+static void rtc_read_time(int *h, int *m, int *s) {
+    while (cmos_read(0x0A) & 0x80);
+    int regb = cmos_read(0x0B);
+    int bin = regb & 4;
+    int raw = cmos_read(0x04);
+    int vm = cmos_read(0x02);
+    int vs = cmos_read(0x00);
+    if (!(regb & 2)) {
+        // 12-hour mode: strip PM bit, convert BCD→decimal, then to 24h
+        int pm = raw & 0x80;
+        raw &= 0x7F;
+        int vh = bin ? raw : (((raw>>4)&0xF)*10 + (raw&0x0F));
+        if (pm) { if (vh != 12) vh += 12; }
+        else { if (vh == 12) vh = 0; }
+        *h = vh;
+    } else {
+        // 24-hour mode: just convert BCD→decimal if needed
+        *h = bin ? raw : (((raw>>4)&0xF)*10 + (raw&0x0F));
+    }
+    *m = bin ? vm : (((vm>>4)&0xF)*10 + (vm&0x0F));
+    *s = bin ? vs : (((vs>>4)&0xF)*10 + (vs&0x0F));
+}
+
+static void rtc_read_full(int *y, int *m, int *d, int *wd) {
+    while (cmos_read(0x0A) & 0x80);
+    int regb = cmos_read(0x0B);
+    int bin = regb & 4;
+    int vy = cmos_read(0x09), vm = cmos_read(0x08), vd = cmos_read(0x07), vw = cmos_read(0x06);
+    if (bin) { *y = vy; *m = vm; *d = vd; *wd = vw; }
+    else {
+        *y = ((vy>>4)*10)+(vy&0x0F);
+        *m = ((vm>>4)*10)+(vm&0x0F);
+        *d = ((vd>>4)*10)+(vd&0x0F);
+        *wd = (vw&0x0F);
+    }
+    *y += 2000;  // CMOS stores two-digit year
+}
+
 #define BG      0x0A0A28
 #define BORDER  0x00E5FF
-#define ACCENT  0x4A9EFF
+#define ACCENT  0x3B82F6   // unico blu accent dell'interfaccia (stile macOS)
 #define TEXT    0x88CCFF
 #define DIM     0x5A6A8A
 #define PANEL_BG 0x0E1030
@@ -189,12 +270,84 @@ static void serial_puts(const char *s) {
     while (*s) serial_write(*s++);
 }
 
+static void serial_dec(int v) {
+    char tmp[16]; int n = 0;
+    if (v < 0) { serial_write('-'); v = -v; }
+    if (v == 0) { serial_write('0'); return; }
+    while (v > 0 && n < 15) { tmp[n++] = '0' + (v % 10); v /= 10; }
+    while (n > 0) serial_write(tmp[--n]);
+}
+
 static int serial_read_timeout(char *c, int max_loops) {
     for (int _i = 0; _i < max_loops; _i++) {
         if (serial_available()) { *c = inb(SERIAL_PORT + 0); return 1; }
         for (volatile int _d = 0; _d < 500000; _d++);
     }
     return 0;
+}
+
+// Wi-Fi panel state (scan reale via proxy)
+static char wifi_names[16][40];
+static int wifi_sig[16];
+static int wifi_sec[16];
+static int wifi_count = 0, wifi_connected = 0, wifi_scan_done = 0;
+
+static void wifi_request_scan(void)
+{
+    wifi_count = 0;
+    wifi_connected = 0;
+    wifi_scan_done = 0;
+    while (serial_available()) serial_read();
+    serial_puts("WIFI|SCAN\n");
+    for (int _tw = 0; _tw < 15000; _tw++) {
+        if (serial_available()) break;
+        for (volatile int _d = 0; _d < 300000; _d++);
+    }
+    char _rline[64];
+    while (serial_available()) {
+        int _ri = 0;
+        while (_ri < 63) {
+            if (!serial_read_timeout(&_rline[_ri], 4000)) break;
+            if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;
+            _ri++;
+        }
+        _rline[_ri] = 0;
+        if (_rline[0] == 'E' && _rline[1] == 'N' && _rline[2] == 'D' && _rline[3] == 0) break;
+        if (_rline[0] == 'W' && _rline[1] == 'I' && _rline[2] == 'F' && _rline[3] == 'I' && _rline[4] == '|' && wifi_count < 15) {
+            char *p = _rline + 5;
+            int _n = 0;
+            while (*p && *p != '|' && _n < 39) wifi_names[wifi_count][_n++] = *p++;
+            wifi_names[wifi_count][_n] = 0;
+            if (*p == '|') p++;
+            int _rssi = 0, _neg = 0;
+            if (*p == '-') { _neg = 1; p++; }
+            while (*p && *p != '|' && *p >= '0' && *p <= '9') { _rssi = _rssi * 10 + (*p - '0'); p++; }
+            if (*p == '|') p++;
+            wifi_sig[wifi_count] = _neg ? -_rssi : _rssi;
+            wifi_sec[wifi_count] = (p[0] == 'O' && p[1] == 'P') ? 0 : 1;
+            wifi_count++;
+        }
+    }
+    wifi_scan_done = 1;
+}
+
+static int wifi_bars(int rssi)
+{
+    if (rssi >= -55) return 4;
+    if (rssi >= -65) return 3;
+    if (rssi >= -75) return 2;
+    if (rssi >= -85) return 1;
+    return 1;
+}
+
+// Ricezione bulk per l'audio: poll veloce senza delay, con tetto di poll vuoti.
+static int serial_read_bulk(char *buf, int n, int max_empty) {
+    int got = 0, empty = 0;
+    while (got < n) {
+        if (serial_available()) { buf[got++] = inb(SERIAL_PORT + 0); empty = 0; }
+        else { if (++empty > max_empty) break; }
+    }
+    return got;
 }
 
 #include "system_transfer.c"
@@ -268,10 +421,289 @@ static void studio_print_hl(int mode, const char *line, int x, int y) {
     #undef KW
 }
 
+// ─────────────────────────────────────────────────────────────
+// HOME overlay + OEM Unlocker + BootLoader Command Line
+// ─────────────────────────────────────────────────────────────
+
+static int bootloader_unlocked = 0;   // REAL unlock flag (persistent kernel-global)
+static int _pending_launch = 0;       // app launched after a full desktop redraw (Home)
+static int home_active = 0;           // 1 = Home overlay open
+static int home_focus = 0;            // 0 = apps grid, 1 = System Apps
+static int home_sel = 0;              // selected app in the left grid
+static int home_sys_sel = 0;          // selected System App on the right
+static int oem_active = 0;            // 1 = Kairo Blue BIOS open
+
+#define HOME_COLS 4
+#define HOME_APP_COUNT 30
+#define HOME_PW 490
+#define HOME_PH 470
+#define HOME_VROWS 6
+static int home_scroll = 0;
+static const int home_app_act[HOME_APP_COUNT] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 17, 18, 19,
+    20, 21, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 35, 36
+};
+static const char *const home_app_name[HOME_APP_COUNT] = {
+    "Terminal","Settings","OreoAI","Calculator","Notes","App Store",
+    "Studio","KairoVM","Camera","Player","True Video","Calendar",
+    "Pomodoro","Weather","Monitor","Art","Typing","Files","Tetris",
+    "Games","Snake","Wii","Mic Test","Pong","Paint","Maze","Music",
+    "Dino","Browser","Chat"
+};
+
+static char bl_lines[40][80];
+static int bl_count = 0, bl_scroll = 0;
+static char bl_buf[128];
+static int bl_pos = 0;
+
+static void bl_add(const char *s)
+{
+    while (*s && bl_count < 40) {
+        int take = 0;
+        while (s[take] && take < 38) take++;
+        if (take == 38) {
+            while (take > 0 && s[take] != ' ') take--;
+            if (take < 1) take = 38;
+        }
+        int i;
+        for (i = 0; i < take; i++) bl_lines[bl_count][i] = s[i];
+        bl_lines[bl_count][i] = 0;
+        bl_count++;
+        s += take;
+        if (*s == ' ') s++;
+    }
+    bl_scroll = bl_count - 1;
+    if (bl_scroll < 0) bl_scroll = 0;
+}
+
+static int bl_has(const char *s, const char *sub)
+{
+    if (!*sub) return 1;
+    for (; *s; s++) {
+        const char *a = s, *b = sub;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static void bl_open(void)
+{
+    bl_count = 0; bl_scroll = 0; bl_pos = 0; bl_buf[0] = 0;
+    bl_add("[KairoOS BootLoader Command Line v1.0]");
+    if (bootloader_unlocked) {
+        bl_add("Bootloader: UNLOCKED");
+        bl_add("Type 'help' for commands.");
+    } else {
+        bl_add("Bootloader: LOCKED");
+        bl_add("Use OEM Unclocker in System Apps to unlock it.");
+    }
+}
+
+static void bl_redraw(void)
+{
+    gfx_fill_round_rect(wx + 8, wy + 44, ww - 16, wh - 56, 6, 0x02020A);
+    gfx_round_rect(wx + 8, wy + 44, ww - 16, wh - 56, 6, bootloader_unlocked ? 0x0A3A7A : 0x550000);
+    gfx_print(wx + 16, wy + 46, bootloader_unlocked ? 0x66AAFF : 0xFF6644,
+              bootloader_unlocked ? "BOOTLOADER UNLOCKED — KAIRO BLUE" : "BOOTLOADER LOCKED — USE OEM UNCLOCKER");
+    gfx_rect(wx + 8, wy + 58, ww - 16, 1, 0x1A3A5A);
+    int _ml = (wh - 80) / 16; if (_ml < 1) _ml = 1;
+    int _start = bl_scroll - _ml + 1; if (_start < 0) _start = 0;
+    int _ty = wy + 66;
+    for (int i = _start; i <= bl_scroll && i < bl_count; i++) {
+        uint32_t _c = 0x66CCFF;
+        if (bl_lines[i][0] == '[') _c = 0xFFCC44;
+        if (bl_lines[i][0] == '/') _c = 0x44FF66;
+        if (bl_lines[i][0] == '-') _c = 0xFFAA66;
+        gfx_print(wx + 16, _ty, _c, bl_lines[i]);
+        _ty += 16;
+    }
+    char _pb[80]; int _pn = 0, _pi;
+    char _pfx[] = "BLoader:~$ ";
+    for (_pi = 0; _pfx[_pi]; _pi++) _pb[_pn++] = _pfx[_pi];
+    for (_pi = 0; _pi < bl_pos && _pi < 70; _pi++) _pb[_pn++] = bl_buf[_pi];
+    _pb[_pn] = 0;
+    gfx_print(wx + 16, wy + 44 + wh - 56 - 16, 0x44FF66, _pb);
+}
+
+static void draw_home(int w, int h, int slide)
+{
+    // Compact start-menu panel anchored above the home button (bottom-left)
+    int px = 8, pw = HOME_PW;
+    int py = h - 70 - HOME_PH + slide;   // rises into place during animation
+    int ph = HOME_PH;
+
+    // Panel shadow
+    for (int i = 0; i < 6; i++) {
+        int a = (6 - i) * 3;
+        uint32_t c = (a << 16) | (a << 8) | a;
+        gfx_rect(px + 3, py + ph + i, pw, 1, c);
+    }
+    // Frosted glass body
+    gfx_blur_rect(px, py, pw, ph, 10);
+    gfx_rect_alpha(px, py, pw, ph, 0x0C0C2C, 12);
+    gfx_fill_round_rect(px, py, pw, ph, 14, 0x0A0A24);
+    gfx_round_rect(px, py, pw, ph, 14, 0x3A6AFF);
+    gfx_round_rect(px + 1, py + 1, pw - 2, ph - 2, 13, 0x2A3A6A);
+    // Accent top edge
+    gfx_fill_round_rect(px, py, pw, 4, 2, 0x3A6AFF);
+
+    // Header
+    gfx_fill_round_rect(px + 12, py + 8, 32, 32, 16, 0x2244CC);
+    gfx_fill_round_rect(px + 12, py + 8, 32, 32, 16, 0x3A6AFF);
+    fill_tri(px + 16, py + 30, px + 24, py + 14, px + 32, py + 30, 0xFFFFFF);
+    gfx_fill_round_rect(px + 14, py + 26, 20, 7, 3, 0xFFFFFF);
+    gfx_print(px + 52, py + 10, 0xFFFFFF, "Home");
+    gfx_print(px + 52, py + 26, 0x5A7AAA, "KairoOS");
+    // Close button
+    gfx_fill_round_rect(px + pw - 44, py + 8, 36, 36, 18, 0x1A1A3A);
+    gfx_round_rect(px + pw - 44, py + 8, 36, 36, 18, 0x4A5A8A);
+    gfx_print(px + pw - 33, py + 17, 0xFFFFFF, "X");
+
+    // Layout: app grid left, divider, System Apps right
+    int colw = 56, isz = 36;
+    int gx = px + 16;
+    int grid_rows = (HOME_APP_COUNT + HOME_COLS - 1) / HOME_COLS;
+
+    // Apps label
+    gfx_print(gx, py + 52, 0x6A8ABE, "Apps");
+
+    // App grid (scrollable)
+    for (int i = 0; i < HOME_APP_COUNT; i++) {
+        int r = i / HOME_COLS, c = i % HOME_COLS;
+        if (r < home_scroll || r >= home_scroll + HOME_VROWS) continue;
+        int cx = gx + c * colw + (colw - isz) / 2;
+        int cy = py + 66 + (r - home_scroll) * 56;
+        if (home_focus == 0 && home_sel == i) {
+            gfx_fill_round_rect(cx - 6, cy - 4, isz + 12, 52, 8, 0x16224A);
+            gfx_round_rect(cx - 6, cy - 4, isz + 12, 52, 8, 0x3366AA);
+        }
+        gfx_fill_round_rect(cx + 1, cy + 1, isz, isz, 8, 0x000000);
+        gfx_fill_round_rect(cx, cy, isz, isz, 8, 0x2244AA);
+        gfx_round_rect(cx, cy, isz, isz, 8, 0x77BBFF);
+        { char _il[2]; _il[0] = home_app_name[i][0]; _il[1] = 0;
+          gfx_print(cx + isz/2 - 4, cy + isz/2 - 6, 0xFFFFFF, _il); }
+        int nl = 0; while (home_app_name[i][nl]) nl++;
+        int lx = gx + c * colw + (colw - nl * 8) / 2;
+        if (nl > 6) { nl = 6; lx = gx + c * colw + 4; }
+        gfx_print(lx - 1, cy + isz + 2, 0x000000, home_app_name[i]);
+        gfx_print(lx, cy + isz + 3, home_focus == 0 && home_sel == i ? 0xFFFFFF : 0x8899BB, home_app_name[i]);
+    }
+    // Scroll indicator
+    if (grid_rows > HOME_VROWS) {
+        int ind_y = py + 66 + HOME_VROWS * 56 + 4;
+        gfx_print(gx, ind_y, home_scroll > 0 ? 0x4488FF : 0x1A2A4A, "^");
+        gfx_print(gx + 12, ind_y, home_scroll + HOME_VROWS < grid_rows ? 0x4488FF : 0x1A2A4A, "v");
+    }
+
+    // Divider
+    int dx = gx + HOME_COLS * colw + 8;
+    gfx_rect(dx, py + 52, 2, ph - 66, 0x1A2A4A);
+    gfx_rect(dx + 1, py + 52, 1, ph - 66, 0x0E1A3A);
+
+    // System Apps panel
+    int sx = dx + 20, sw = px + pw - 12 - sx;
+    gfx_print(sx, py + 52, 0xFFAA44, "System Apps");
+    gfx_rect(sx, py + 68, sw, 1, 0x2A2A5A);
+
+    int item_h = 50, iy = py + 82;
+    // OEM Unclocker
+    if (home_focus == 1 && home_sys_sel == 0) {
+        gfx_fill_round_rect(sx - 4, iy - 4, sw + 8, item_h + 8, 8, 0x1A2A5E);
+        gfx_round_rect(sx - 4, iy - 4, sw + 8, item_h + 8, 8, 0x4488FF);
+    }
+    gfx_fill_round_rect(sx, iy, sw, item_h, 8, 0x0E0E2A);
+    gfx_round_rect(sx, iy, sw, item_h, 8, 0x3A5A8A);
+    gfx_fill_round_rect(sx + 8, iy + 8, 34, 34, 9, 0x1133AA);
+    gfx_round_rect(sx + 8, iy + 8, 34, 34, 9, 0x66AAFF);
+    gfx_print(sx + 16, iy + 14, 0x88BBFF, "O");
+    gfx_print(sx + 50, iy + 7, 0xFFFFFF, "OEM Unclocker");
+    gfx_print(sx + 50, iy + 24, 0x4A6A9A, "unlock the bootloader");
+    gfx_print(sx + sw - 46, iy + 17, 0x4488FF, "Open >");
+    iy += item_h + 10;
+
+    // BootLoader Command Line (only after real unlock)
+    if (bootloader_unlocked) {
+        if (home_focus == 1 && home_sys_sel == 1) {
+            gfx_fill_round_rect(sx - 4, iy - 4, sw + 8, item_h + 8, 8, 0x0A3A1E);
+            gfx_round_rect(sx - 4, iy - 4, sw + 8, item_h + 8, 8, 0x44FF88);
+        }
+        gfx_fill_round_rect(sx, iy, sw, item_h, 8, 0x0A1A12);
+        gfx_round_rect(sx, iy, sw, item_h, 8, 0x2A5A3A);
+        gfx_fill_round_rect(sx + 8, iy + 8, 34, 34, 9, 0x116633);
+        gfx_round_rect(sx + 8, iy + 8, 34, 34, 9, 0x44FF88);
+        gfx_print(sx + 16, iy + 14, 0x66FFAA, ">_");
+        gfx_print(sx + 50, iy + 7, 0xFFFFFF, "BootLoader CLI");
+        gfx_print(sx + 50, iy + 24, 0x4A6A9A, "advanced boot tools");
+        gfx_print(sx + sw - 46, iy + 17, 0x44FF88, "Open >");
+    }
+
+    gfx_print(px + 12, py + ph - 16, 0x2A3A5A,
+              "[Arrows] nav   [Tab] side   [Enter] open   [Esc] close");
+}
+
+static void open_home(void)
+{
+    int w = gfx_width(), h = gfx_height();
+    home_active = 1;
+    home_focus = 0; home_sel = 0; home_sys_sel = 0; home_scroll = 0;
+    // Cubic ease-out: rises fast at first, decelerates into place
+    for (int f = 24; f >= 0; f--) {
+        int slide = HOME_PH * f * f * f / (24 * 24 * 24);
+        draw_home(w, h, slide);
+        delay();
+    }
+    draw_home(w, h, 0);
+}
+
+static void draw_oem_bios(int w, int h)
+{
+    gfx_clear(0x0000AA);
+    gfx_rect(0, 0, w, 1, 0xFFFFFF);
+    gfx_rect(0, h - 14, w, 14, 0x000080);
+    gfx_print_scaled(w / 2 - 160, 10, 0xFFFFFF, "KAIRO BLUE BIOS v1.0", 2);
+    gfx_rect(w / 2 - 240, 36, 480, 1, 0xFFFFFF);
+    gfx_print(40, 56, 0x8080FF, "Main    Security    Boot    OEM    Save & Exit");
+    gfx_rect(40, 70, 460, 1, 0x8080FF);
+
+    gfx_print(40, 98, 0xFFFF00, "[1]");
+    gfx_print(80, 98, 0xFFFFFF, "Unlock OEM");
+    gfx_print(40, 124, 0x8080FF, "Unlocks the KairoOS bootloader for advanced commands.");
+
+    gfx_fill_round_rect(w / 2 - 120, h - 110, 240, 44, 8, 0x000080);
+    gfx_round_rect(w / 2 - 120, h - 110, 240, 44, 8, 0x44AAFF);
+    gfx_print_scaled(w / 2 - 66, h - 98, 0x00FF00, "[ UNLOCK OEM ]", 1);
+    gfx_print(60, h - 84, 0x8080FF,
+              bootloader_unlocked ? "Bootloader: UNLOCKED" : "Bootloader: LOCKED");
+    gfx_print(60, h - 62, 0x8080FF, "Use [1] or click UNLOCK to enable the bootloader command line.");
+    gfx_print(40, h - 32, 0x8080FF, "[Esc] back to Home");
+}
+
+static void oem_do_unlock(void)
+{
+    int w = gfx_width(), h = gfx_height();
+    // Black screen for a few seconds (simulated unlock write)
+    gfx_clear(0x000000);
+    for (int i = 0; i < 16; i++) delay();
+    // Warning banner for ~5 seconds
+    gfx_clear(0x000000);
+    gfx_rect(0, 0, w, 1, 0x44FF44);
+    gfx_rect(0, h - 1, w, 1, 0x44FF44);
+    gfx_print_scaled(w / 2 - 160, h / 2 - 70, 0x44FF44, "BOOTLOADER ABILITATO", 2);
+    gfx_print(w / 2 - 300, h / 2, 0xCCCCCC,
+              "Nel terminale ora avrai dei commandi specifici.");
+    gfx_print(w / 2 - 300, h / 2 + 22, 0xCCCCCC,
+              "Apri BootLoader Command Line e digita help per info.");
+    gfx_print(w / 2 - 60, h / 2 + 60, 0x2A6A2A, "[ 5s ]");
+    for (int i = 0; i < 50; i++) delay();
+    // REAL unlock: the bootloader flag persists for the whole session
+    bootloader_unlocked = 1;
+    oem_active = 0;
+    home_active = 0;
+}
+
 void kernel_main(void) {
     kernel_early();
-
-    __asm__ volatile("sti");
 
     __asm__ volatile("movl 0x70000, %0" : "=r"(g_fb_addr) : : "memory");
     if (!g_fb_addr) g_fb_addr = 0xFD000000;
@@ -282,6 +714,8 @@ void kernel_main(void) {
     if (vbe_w < 640 || vbe_h < 480) { vbe_w = 1024; vbe_h = 768; }
 
     kernel_memory(g_fb_addr);
+
+    __asm__ volatile("sti");
 
     fb_info_t fb;
     fb.framebuffer = (volatile uint32_t*)(uintptr_t)g_fb_addr;
@@ -303,6 +737,31 @@ void kernel_main(void) {
     // Init serial port for social proxy
     serial_init();
 
+    // Mount initial RAM filesystem
+    initrd_load();
+
+    // Mount disk filesystem if AHCI disk available
+    if (ahci_disk_port >= 0) {
+        if (kfs_mount(ahci_disk_port) < 0) {
+            fb_write("Nessun FS su disco, formattazione...\n");
+            if (kfs_format(ahci_disk_port) == 0)
+                kfs_mount(ahci_disk_port);
+        }
+    }
+
+    // Launch user-mode init from the initrd (real ring3 program).
+    // kernel_setjmp saves the kernel context; when /init calls exit,
+    // proc_exit switches back to kernel page tables and longjmps here,
+    // so control resumes with the desktop GUI below.
+    fb_init();
+    fb_write("Kairo-OS: launching /init in ring3...\n");
+    if (kernel_setjmp(kctx) == 0) {
+        elf_load_and_exec("/init");
+        fb_write("init returned (error)\n");
+        while (1) { __asm__ volatile("hlt"); }
+    }
+    __asm__ volatile("sti");
+
     int w = vbe_w, h = vbe_h, win = 0, win_type = 0;
     int search_focus = 1, search_pos = 0, search_sel = 0;
     char search_buf[64] = {0};
@@ -310,11 +769,14 @@ void kernel_main(void) {
     char term_lines[60][80]; for (int _t=0;_t<60;_t++) term_lines[_t][0]=0;
     char chat_buf[128] = {0}; int chat_pos = 0, chat_line_count = 0, chat_scroll = 0;
     char chat_lines[60][80]; for (int _c=0;_c<60;_c++) chat_lines[_c][0]=0;
+    // Speech-to-text (Viteza STT — motore custom MFCC+DTW su host)
+    int stt_active = 0, stt_train = 0, stt_ticks = 0;
     char br_url[128] = {0}; int br_pos = 0, br_line_count = 0, br_scroll = 0, br_fetching = 0;
     char br_lines[60][80]; for (int _b=0;_b<60;_b++) br_lines[_b][0]=0;
     char notes[10][80]; int note_count = 0, note_sel = 0;
     char note_buf[80] = {0}; int note_pos = 0;
     int set_state = 0, set_cat = 0;
+    char account_name[40] = {0};
     int usb_popup = 0;
     int apps_installed[27] = {1,1,1,1,1,0,0,0,1,0,0,0,1,0,1,0,1,1,0,0,0,0,0,0,0,0,1};
     int studio_panel = 0, studio_file = 0, studio_output_count = 0;
@@ -351,6 +813,8 @@ int cmd_active = 0, cmd_pos = 0; char cmd_buf[64] = {0};
 int cc_active = 0, cc_sel = 0;
 // Notification Center
 int nc_active = 0, nc_sel = 0;
+// Wi-Fi panel (scan reale via proxy)
+int wifi_active = 0, wifi_sel = 0;
 // AI Command Mode
 int ai_active = 0, ai_pos = 0, ai_response = 0;
 char ai_buf[128] = {0};
@@ -433,14 +897,14 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
     } while(0)
     #define NET_MAX 12
     int setup_done = 0, setup_step = 0;
-    // 0=Welcome, 1=Personalize, 2=Network/Wi-Fi, 3=Ready
+    // 0=Welcome, 1=Account, 2=Personalize, 3=Network/Wi-Fi, 4=Ready
     while (!setup_done) {
         gfx_clear(0x080818);
         gfx_fill_round_rect(0,0,w,h,12,0x0A0A22);
         gfx_round_rect(2,2,w-4,h-4,10,BORDER);
         // Step dots (bigger)
-        for (int si=0;si<4;si++){
-            int dx=w/2-54+si*36;
+        for (int si=0;si<5;si++){
+            int dx=w/2-72+si*36;
             gfx_fill_round_rect(dx,16,24,24,12,si==setup_step?0x4488FF:0x2A2A4A);
             char sn[2]={'1'+si,0}; gfx_print(dx+6,20,si==setup_step?0xFFFFFF:0x6A7A9E,sn);
         }
@@ -455,6 +919,32 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
             if(k=='\n')setup_step=1;
             if(k==27){setup_done=1;break;}
         }else if(setup_step==1){
+            // Create account
+            gfx_print_scaled(w/2-170,60,BORDER,"CREATE ACCOUNT",3);
+            gfx_print_scaled(w/2-140,120,0x6A7A9E,"Enter your name to personalise Viteza:",1);
+            // Avatar preview
+            gfx_fill_round_rect(w/2-46,165,92,92,46,0x1A3A8A);
+            gfx_round_rect(w/2-46,165,92,92,46,ACCENT);
+            gfx_fill_round_rect(w/2-26,190,52,24,12,0x8A9ACE);
+            gfx_fill_round_rect(w/2-34,232,68,10,5,0x4A6ABE);
+            // Name input
+            gfx_fill_round_rect(w/2-210,300,420,44,8,0x12123A);
+            gfx_round_rect(w/2-210,300,420,44,8,ACCENT);
+            char _nm[42]; int _npl = 0;
+            for(_npl=0;_npl<39 && account_name[_npl];_npl++) _nm[_npl]=account_name[_npl];
+            if(_npl<39){ _nm[_npl]='_'; _nm[_npl+1]=0; } else _nm[39]=0;
+            gfx_print_scaled(w/2-190,310,0xFFFFFF,_nm,1);
+            gfx_print_scaled(w/2-195,368,0x6A7A9E,"[A-Z 0-9 space] type  [Backspace] delete",1);
+            gfx_print_scaled(w/2-130,400,0x3A4A6A,"[Enter] next  [Esc] skip to desktop",1);
+            char k=keyboard_last_char();
+            int _alen=0; while(account_name[_alen])_alen++;
+            if(k=='\b'){ if(_alen>0) account_name[_alen-1]=0; }
+            else if(k=='\n'){ setup_step=2; }
+            else if(k==27){ setup_done=1; break; }
+            else if((k>='a'&&k<='z')||(k>='0'&&k<='9')||k==' '){
+                if(_alen<39){ account_name[_alen]=k; }
+            }
+        }else if(setup_step==2){
             gfx_print_scaled(w/2-120,60,BORDER,"PERSONALIZE",3);
             gfx_print_scaled(w/2-140,120,0x6A7A9E,"Configure your preferences:",1);
             draw_toggle(w/2-160,170,set_state&1);
@@ -469,9 +959,9 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
             if(k=='1')set_state^=1;
             if(k=='2')set_state^=2;
             if(k=='3')set_state^=4;
-            if(k=='\n')setup_step=2;
+            if(k=='\n')setup_step=3;
             if(k==27){setup_done=1;break;}
-        }else if(setup_step==2){
+        }else if(setup_step==3){
             // Wi-Fi selection (integrated into wizard)
             gfx_print_scaled(w/2-130,60,BORDER,"WI-FI NETWORKS",3);
             gfx_rect(w/2-300,96,600,1,0x2A5EAF);
@@ -505,15 +995,22 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
                 if(k==' '){connecting=1;connected=0;}
             }
             if(connecting&&!connected){delay();connected=1;connecting=0;}
-            if(k=='\n')setup_step=3;
+            if(k=='\n')setup_step=4;
             if(k==27){setup_done=1;break;}
-        }else if(setup_step==3){
+        }else if(setup_step==4){
             gfx_print_scaled(w/2-100,60,BORDER,"ALL SET!",3);
             gfx_print_scaled(w/2-150,140,0x44FF44,"Your Viteza OS is ready.",1);
-            if(set_state&1)gfx_print_scaled(w/2-140,200,0x6A7A9E,"Dark Mode: ON",1);
-            if(set_state&2)gfx_print_scaled(w/2-140,230,0x6A7A9E,"Notifications: ON",1);
-            if(set_state&4)gfx_print_scaled(w/2-140,260,0x6A7A9E,"Developer Mode: ON",1);
-            gfx_print_scaled(w/2-130,320,0x8A9ACE,"Press [Enter] to start.",1);
+            char _hb[64]; int _hi=0;
+            const char *_hn = account_name[0] ? account_name : "Viteza User";
+            const char *_pref="Welcome, ";
+            for(int _jj=0;_pref[_jj]&&_hi<62;_hi++)_hb[_hi]=_pref[_jj++];
+            for(int _jj=0;_hn[_jj]&&_hi<62;_hi++)_hb[_hi]=_hn[_jj++];
+            _hb[_hi]=0;
+            gfx_print_scaled(w/2-130,180,0x8A9ACE,_hb,1);
+            if(set_state&1)gfx_print_scaled(w/2-140,220,0x6A7A9E,"Dark Mode: ON",1);
+            if(set_state&2)gfx_print_scaled(w/2-140,250,0x6A7A9E,"Notifications: ON",1);
+            if(set_state&4)gfx_print_scaled(w/2-140,280,0x6A7A9E,"Developer Mode: ON",1);
+            gfx_print_scaled(w/2-130,340,0x8A9ACE,"Press [Enter] to start.",1);
             char k=keyboard_last_char();
             if(k=='\n')setup_done=1;
             if(k==27){setup_done=1;break;}
@@ -522,6 +1019,9 @@ const char *vm_os_name[3] = {"macOS 15 Sequoia","Windows 11 Pro","Ubuntu 24.04 L
     }
     keyboard_last_char();
     delay();
+
+    // Startup sound when the desktop is reached
+    play_startup_melody();
 
     // ─── Desktop (macOS style) ───
 redraw_desktop:
@@ -642,6 +1142,18 @@ redraw_desktop:
         gfx_print_scaled(w/2 - 80, 52, 0x44FF44, "Merry Christmas", 1);
     }
 
+    // Subtle vignette: darken the edges for depth (costs ~4k px)
+    for (int _vi = 0; _vi < 40; _vi++) {
+        int _va = (39 - _vi) * 2;          // alpha 0..78, stronger toward edges
+        gfx_rect_alpha(0, h - 40 + _vi, w, 1, 0x000000, _va > 12 ? 12 : _va);
+        gfx_rect_alpha(0, _vi, w, 1, 0x000000, _va > 10 ? 10 : _va);
+    }
+    for (int _vi = 0; _vi < 40; _vi++) {
+        int _va = (39 - _vi) * 2;
+        gfx_rect_alpha(w - 40 + _vi, 0, 1, h, 0x000000, _va > 10 ? 10 : _va);
+        gfx_rect_alpha(_vi, 0, 1, h, 0x000000, _va > 8 ? 8 : _va);
+    }
+
     // ─── Top menu bar (macOS style) ───
     int mby = 0, mbh = 24;
     dm = set_state & 1;
@@ -665,13 +1177,16 @@ redraw_desktop:
         gfx_putpixel(12, 10, dm ? 0x88CCFF : 0xFFFFFF);
         gfx_print(24, 5, dm ? 0x6677AA : 0x8899CC, "Viteza");
     }
+    // Account name (next to the logo)
+    int _acc_len = 0; while (account_name[_acc_len]) _acc_len++;
+    gfx_print(76, 5, dm ? 0x7788BB : 0x9AABCE, account_name[0] ? account_name : "User");
     // App name when window is open
     _app_name = "Finder";
     if(win && win_type > 0 && win_type < 37) {
         switch(win_type){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="App Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break; case 33:_app_name="Music";break; case 34:_app_name="Dino";break; case 35:_app_name="Browser";break; case 36:_app_name="Chat";break;
         }
-        gfx_rect(85, 6, 2, 12, dm ? 0x1A1A3A : 0x2A2A5A);
-        gfx_print(92, 5, dm ? 0x8899CC : 0xAABBEE, _app_name);
+        gfx_rect(84 + _acc_len*8, 6, 2, 12, dm ? 0x1A1A3A : 0x2A2A5A);
+        gfx_print(91 + _acc_len*8, 5, dm ? 0x8899CC : 0xAABBEE, _app_name);
     }
     int _hr = 12, _mn = 0; rtc_read(&_hr, &_mn);
     char _time[6]; _time[0]='0'+_hr/10; _time[1]='0'+_hr%10; _time[2]=':';
@@ -751,6 +1266,18 @@ redraw_desktop:
         uint32_t gl = (a/2<<16)|(a/4<<8)|a;
         gfx_rect(dc_x+30+i*5, dc_y+dc_h+i, dc_w-60-i*10, 1, gl);
     }
+
+    // ─── Home button (left of dock) ───
+    int hb_x = dc_x - 76, hb_y = dc_y + 4, hb_w = 56, hb_h = 52;
+    gfx_fill_round_rect(hb_x+2, hb_y+2, hb_w, hb_h, 16, 0x000000);
+    gfx_fill_round_rect(hb_x, hb_y, hb_w, hb_h, 16, 0x0C0C2A);
+    gfx_round_rect(hb_x, hb_y, hb_w, hb_h, 16, 0x3A6AFF);
+    gfx_round_rect(hb_x+1, hb_y+1, hb_w-2, hb_h-2, 15, 0x2A4ABE);
+    { int _hcx = hb_x + hb_w/2, _hcy = hb_y + 12;
+      fill_tri(_hcx-16, _hcy+12, _hcx, _hcy-8, _hcx+16, _hcy+12, 0x88BBFF);
+      gfx_fill_round_rect(_hcx-9, _hcy+10, 18, 18, 3, 0x4488FF);
+      gfx_fill_round_rect(_hcx-5, _hcy+13, 10, 15, 2, 0x2A5AEE); }
+    gfx_putpixel(hb_x+hb_w-12, hb_y+12, 0x88BBFF);
 
     // ─── Dock Icons — macOS quality, no pixels ───
     int di_y = dc_y + 8, di_sz = 40, di_sp = 56;
@@ -930,11 +1457,12 @@ redraw_desktop:
     int dc_x2 = w - 170, dc_y2 = 90;
     gfx_fill_round_rect(dc_x2, dc_y2, 140, 60, 8, 0x080820);
     gfx_round_rect(dc_x2, dc_y2, 140, 60, 8, 0x2A3A6A);
-    char _td[9]; _td[0]='0'+_hr/10; _td[1]='0'+_hr%10; _td[2]=':';
-    _td[3]='0'+_mn/10; _td[4]='0'+_mn%10; _td[5]=':'; 
-    rtc_read(&_hr, &_mn); // refresh time
-    _td[5] = 0;
-    gfx_print_scaled(dc_x2+16, dc_y2+8, 0x4488FF, _td, 2);
+    int _dhs = 0, _dms = 0, _dss = 0; rtc_read_time(&_dhs, &_dms, &_dss);
+    char _td[9]; _td[0]='0'+_dhs/10; _td[1]='0'+_dhs%10; _td[2]=':';
+    _td[3]='0'+_dms/10; _td[4]='0'+_dms%10; _td[5]=0;
+    gfx_print_scaled(dc_x2+16, dc_y2+8, ACCENT, _td, 2);
+    _td[5]=':'; _td[6]='0'+_dss/10; _td[7]='0'+_dss%10; _td[8]=0;
+    gfx_print(dc_x2+16, dc_y2+40, 0x3A4A6A, _td+5);
     gfx_print(dc_x2+12, dc_y2+44, 0x3A4A6A, "Viteza OS");
     // Weather widget (below clock)
     int _wwx = w - 170, _wwy = 160;
@@ -970,10 +1498,6 @@ redraw_desktop:
         gfx_round_rect(sb_x+sb_w+12, sb_y, 110, sb_h, 10, 0x5A2A2A);
         gfx_print(sb_x+sb_w+16, sb_y+2, 0xCC4444, "NIC: none");
     }
-
-    // Keyboard shortcut bar (above dock)
-    gfx_print(w/2-500, dc_y-18, 0x3A4A6A,
-        "[1]  [2]  [3]Term  [4]Set  [5]Oreo  [6]Calc  [7]Notes  [8]Store  [9]Studio  [0]VM  [S]Music  [D]ino  [P]ong  [B]rush  [X]aze  [M]ic  [E]Cal  [R]Pomo  [W]Wthr  [A]Art  [Y]Type  [G]Tet  [K]Games  [Z]Wii  [Esc]");
 
     // Search focused by default
     search_focus = 1; int _tick = 0;
@@ -1226,27 +1750,23 @@ redraw_desktop:
             snake_body[1][0]=4;snake_body[1][1]=9;\
             snake_body[2][0]=3;snake_body[2][1]=9;\
             snake_food_x=8;snake_food_y=8;\
+        }else if(_act==28){open_app(28);draw_mac_title("Viteza Wii");_wii_boot=1;\
+        }else if(_act==29){ac97_start_capture();open_app(29);draw_mac_title("Mic Test");\
+        }else if(_act==30){open_app(30);draw_mac_title("Pong");\
+        }else if(_act==31){open_app(31);draw_mac_title("Paint");\
+        }else if(_act==32){open_app(32);draw_mac_title("Maze");\
+        }else if(_act==33){open_app(33);draw_mac_title("Music Player");\
+        }else if(_act==34){open_app(34);draw_mac_title("Dino Runner");\
+        }else if(_act==36){open_app(36);draw_mac_title("Kairo Chat");\
         }else if(_act==35){open_app(35);draw_mac_title("Net Browser");\
             br_url[0]=0;br_pos=0;br_line_count=0;br_scroll=0;br_fetching=0;\
+        }else if(_act==37){open_app(37);draw_mac_title("BootLoader Command Line");\
+            bl_open();bl_redraw();\
         }\
     } while(0)
 
-    int wx=w/2-200, wy=h/2-160, ww=400, wh=280;
-
     // Helper to close window (restore macOS wallpaper background + stars)
      #define close_win() do {\
-        /* Shrink animation — 3 steps to center */\
-        int _csizes[] = {ww, 180, 60};\
-        int _chgts[] = {wh, 120, 40};\
-        int _crads[] = {12, 8, 4};\
-        int _ccw = wx + ww/2, _cch = wy + wh/2;\
-        for (int _ci = 0; _ci < 3; _ci++) {\
-            int _cw2 = _csizes[_ci], _ch2 = _chgts[_ci];\
-            int _cx2 = _ccw - _cw2/2, _cy2 = _cch - _ch2/2;\
-            gfx_fill_round_rect(_cx2, _cy2, _cw2, _ch2, _crads[_ci], 0x0E0E28);\
-            gfx_round_rect(_cx2, _cy2, _cw2, _ch2, _crads[_ci], 0x3A5ADF);\
-            for (volatile int _cd = 0; _cd < 300000; _cd++);\
-        }\
         win=0;win_type=0;\
         int _cx1=wx,_cy1=wy,_cx2=wx+ww+8,_cy2=wy+wh+8;\
         int _dmc = set_state & 1;\
@@ -1314,77 +1834,79 @@ redraw_desktop:
         }\
     } while(0)
 
-    // macOS window chrome — realistic traffic light buttons with shine
+    // Window chrome — nuovo renderer font8x8 (ui/renderer/renderer.c)
+    // Regola finestra: sfondo bianco → componenti binari dentro la finestra in altri colori
     #define draw_mac_title(k_) do {\
-        int _dmc = set_state & 1;\
-        if (_natal_mode) {\
-            gfx_fill_round_rect(wx+4,wy+4,ww-8,30,8,0x1A0404);\
-            gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,0x2A0A0A);\
-            gfx_rect(wx+8,wy+22,ww-16,12,0x1A0404);\
-            gfx_rect(wx+4,wy+35,ww-8,1,0x660000);\
-            gfx_print_shadow(wx+ww/2-28,wy+7,0xFF6644,k_);\
-            gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xCC3333);\
-            gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF6666);\
-            gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
-            gfx_fill_round_rect(wx+26,wy+8,12,12,6,0x44AA44);\
-            gfx_fill_round_rect(wx+28,wy+9,4,3,2,0x66DD66);\
-            gfx_fill_round_rect(wx+27,wy+9,2,2,1,0x88EE88);\
-            gfx_fill_round_rect(wx+42,wy+8,12,12,6,0xDDAA22);\
-            gfx_fill_round_rect(wx+44,wy+9,4,3,2,0xEECC44);\
-            gfx_fill_round_rect(wx+43,wy+9,2,2,1,0xFFEE66);\
-        } else {\
-            gfx_fill_round_rect(wx+4,wy+4,ww-8,30,8,_dmc?0x141430:0x1E1E3E);\
-            gfx_fill_round_rect(wx+4,wy+4,ww-8,20,8,_dmc?0x1A1A38:0x282852);\
-            gfx_rect(wx+8,wy+22,ww-16,12,_dmc?0x141430:0x1E1E3E);\
-            gfx_rect(wx+4,wy+35,ww-8,1,_dmc?0x24244A:0x3A3A6A);\
-            gfx_print_shadow(wx+ww/2-28,wy+7,_dmc?0x667799:0x8899CC,k_);\
-            gfx_fill_round_rect(wx+10,wy+8,12,12,6,0xDD4A4A);\
-            gfx_fill_round_rect(wx+12,wy+9,4,3,2,0xFF7A7A);\
-            gfx_fill_round_rect(wx+11,wy+9,2,2,1,0xFF9999);\
-            gfx_fill_round_rect(wx+26,wy+8,12,12,6,0xCCAA33);\
-            gfx_fill_round_rect(wx+28,wy+9,4,3,2,0xEECC66);\
-            gfx_fill_round_rect(wx+27,wy+9,2,2,1,0xEEDD88);\
-            gfx_fill_round_rect(wx+42,wy+8,12,12,6,0x44AA44);\
-            gfx_fill_round_rect(wx+44,wy+9,4,3,2,0x66DD66);\
-            gfx_fill_round_rect(wx+43,wy+9,2,2,1,0x88EE88);\
-        }\
+        uint32_t _tb, _bb, _tt;\
+        if (_natal_mode) { _tb = 0x1A0404; _bb = 0xE8E0C8; _tt = 0x2A0404; }\
+        else { _tb = 0x2D2D34; _bb = 0xDCDCE0; _tt = 0xFFFFFF; }\
+        renderer_draw_window(wx, wy, ww, wh, (k_), _tb, _bb, _tt);\
+        g_win_title = (k_);\
+        g_win.x = wx; g_win.y = wy; g_win.w = ww; g_win.h = wh;\
     } while(0)
 
      #define open_app(n) do {\
+        if (!g_win_init) { wx = w/2-200; wy = h/2-160; g_win_init = 1; }\
+        ww = 400; wh = 280;\
+        g_win.x = wx; g_win.y = wy; g_win.w = ww; g_win.h = wh;\
         win=1;win_type=n;\
         int _dmc = set_state & 1;\
         /* Set app name for menu bar */\
-        switch(n){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break; case 33:_app_name="Music";break; case 34:_app_name="Dino";break; case 35:_app_name="Browser";break; case 36:_app_name="Chat";break;\
+        switch(n){ case 3:_app_name="Terminal";break; case 4:_app_name="Settings";break; case 5:_app_name="OreoAI";break; case 6:_app_name="Calculator";break; case 7:_app_name="Notes";break; case 8:_app_name="Store";break; case 9:_app_name="Studio";break; case 10:_app_name="KairoVM";break; case 11:_app_name="Camera";break; case 12:_app_name="Player";break; case 14:_app_name="TrueVideo";break; case 16:_app_name="Calendar";break; case 17:_app_name="Pomodoro";break; case 18:_app_name="Weather";break; case 19:_app_name="Monitor";break; case 20:_app_name="Art";break; case 21:_app_name="Typing";break; case 22:_app_name="Clipboard";break; case 23:_app_name="Files";break; case 24:_app_name="Tetris";break; case 25:_app_name="Games";break; case 26:_app_name="Snake";break; case 28:_app_name="Wii";break; case 29:_app_name="Mic Test";break; case 30:_app_name="Pong";break; case 31:_app_name="Paint";break; case 32:_app_name="Maze";break;         case 33:_app_name="Music";break; case 34:_app_name="Dino";break; case 35:_app_name="Browser";break; case 36:_app_name="Chat";break; case 37:_app_name="BootLoader";break;\
         }\
-        /* Window expand animation — 4 steps from center */\
-        int _cw = wx + ww/2, _ch = wy + wh/2;\
-        int _asizes[] = {60, 120, 200, ww};\
-        int _ahgts[] = {40, 80, 140, wh};\
-        int _arads[] = {4, 6, 8, 12};\
-        for (int _ai = 0; _ai < 4; _ai++) {\
-            int _aw = _asizes[_ai], _ah = _ahgts[_ai];\
-            int _ax = _cw - _aw/2, _ay = _ch - _ah/2;\
-            gfx_fill_round_rect(_ax, _ay, _aw, _ah, _arads[_ai], 0x0E0E28);\
-            gfx_round_rect(_ax, _ay, _aw, _ah, _arads[_ai], 0x3A5ADF);\
-            for (volatile int _ad = 0; _ad < 300000; _ad++);\
-        }\
-        /* Outer shadow (wide, soft) */\
-        gfx_fill_round_rect(wx+10,wy+12,ww,wh,12,0x000008);\
-        gfx_fill_round_rect(wx+8,wy+10,ww,wh,12,0x00000C);\
-        gfx_fill_round_rect(wx+6,wy+8,ww,wh,12,0x000010);\
-        /* Inner shadow (tight, dark) */\
-        gfx_fill_round_rect(wx+4,wy+6,ww,wh,12,0x000018);\
-        gfx_fill_round_rect(wx+2,wy+4,ww,wh,12,0x00001E);\
-        /* Window body */\
-        gfx_fill_round_rect(wx,wy,ww,wh,12,0x0E0E28);\
-        gfx_round_rect(wx,wy,ww,wh,12,0x3A5ADF);\
-        gfx_round_rect(wx+1,wy+1,ww-2,wh-2,11,0x2A3ABE);\
-        gfx_fill_round_rect(wx+2,wy+2,ww-4,14,10,0x141430);\
-        gfx_rect(wx+4,wy+14,ww-8,2,0x0E0E28);\
         /* Update menu bar app name */\
         gfx_rect(83,4,140,16,_dmc?0x06060E:0x0A0A1C);\
         gfx_rect(85,6,2,12,_dmc?0x1A1A3A:0x2A2A5A);\
         gfx_print_shadow(92,5,_dmc?0x8899CC:0xAABBEE,_app_name);\
+    } while(0)
+
+    // Restore wallpaper + stars over a rect (usato quando si sposta la finestra)
+    #define restore_win_area(px,py,pw,ph) do {\
+        int _cx1=px,_cy1=py,_cx2=px+pw+8,_cy2=py+ph+8;\
+        int _dmc = set_state & 1;\
+        if(_cx2>w){_cx2=w;}if(_cy2>h){_cy2=h;}\
+        for(int _y=_cy1;_y<_cy2;_y++){\
+            int _t=_y*255/h,_r,_g,_b;\
+            if(_dmc){\
+                _r=2+_t/60;_g=1+_t/40;_b=8+_t/30;\
+                if(_y<180){int _f=180-_y;_r=4+_f/40;_g=2+_f/60;_b=12+_f/15;}\
+                if(_r>8){_r=8;}if(_g>6){_g=6;}if(_b>20){_b=20;}\
+            }else{\
+                _r=8+_t/30;_g=6+_t/20;_b=24+_t/10;\
+                if(_y<180){int _f=180-_y;_r=18+_f/12;_g=10+_f/20;_b=50+_f/6;}\
+                if(_r>32){_r=32;}if(_g>28){_g=28;}if(_b>60){_b=60;}\
+            }\
+            gfx_rect(_cx1,_y,_cx2-_cx1,1,(_r<<16)|(_g<<8)|_b);\
+        }\
+        for(int _i=0;_i<60;_i++){\
+            int _sx=(_i*691+47)%w,_sy=(_i*983+19)%(h*3/5);\
+            if(_sx>=_cx1&&_sx<_cx2&&_sy>=_cy1&&_sy<_cy2){\
+                int _sb=(_i*257+13)%6;if(_sb<2)continue;\
+                uint32_t _sc=_dmc?0x224466:0x8899CC;\
+                gfx_fill_round_rect(_sx-1,_sy-1,3,3,1,_sc);\
+            }\
+        }\
+    } while(0)
+
+    // Ridisegna corpo+ombra finestra senza animazione (per il drag)
+    #define open_app_redraw() do {\
+        int _dmc = set_state & 1;\
+        gfx_rect(83,4,140,16,_dmc?0x06060E:0x0A0A1C);\
+        gfx_rect(85,6,2,12,_dmc?0x1A1A3A:0x2A2A5A);\
+        gfx_print_shadow(92,5,_dmc?0x8899CC:0xAABBEE,_app_name);\
+    } while(0)
+
+    // Ridisegna il contenuto dell'app dopo uno spostamento
+    #define win_content_redraw() do {\
+        if (win_type == 3) term_redraw();\
+        else if (win_type == 4) settings_redraw();\
+        else if (win_type == 5 || win_type == 36) chat_redraw();\
+        else if (win_type == 6) calc_redraw();\
+        else if (win_type == 7) _notes_open();\
+        else if (win_type == 8) _store_open();\
+        else if (win_type == 10) vm_redraw();\
+        else if (win_type == 35) br_redraw();\
+        else if (win_type == 37) bl_redraw();\
     } while(0)
 
     // Add a wrapped terminal line (max 38 chars per line, properly multi-line)
@@ -1446,8 +1968,8 @@ redraw_desktop:
         for(_pi=0;_pfix[_pi];_pi++)_pb[_pn++]=_pfix[_pi];\
         for(_pi=0;_pi<term_pos&&_pi<44;_pi++)_pb[_pn++]=term_buf[_pi];\
         _pb[_pn]=0;\
-        gfx_print(wx+16,wy+44+wh-56-16,_natal_mode?0xFF4444:0x00FF44,_pb);\
-        int _ml = (wh-72)/16 - 1; if(_ml<1) _ml=1;\
+        gfx_print(wx+16,wy+44+wh-56-20,_natal_mode?0xFF4444:0x00FF44,_pb);\
+        int _ml = (wh-72)/20 - 1; if(_ml<1) _ml=1;\
         int _start = term_scroll - _ml + 1; if(_start<0) _start=0;\
         int _ty = wy+56;\
         for(int _i=_start; _i<=term_scroll && _i<term_line_count; _i++){\
@@ -1455,7 +1977,7 @@ redraw_desktop:
             if(term_lines[_i][0]=='['){_tc=_natal_mode?0x44FF44:0x00AA44;}if(term_lines[_i][0]=='#'){_tc=0xFF4444;}\
             if(term_lines[_i][0]=='%'){_tc=0xFFFF44;}\
             if(_natal_mode&&_i==term_line_count-1&&term_lines[_i][0]==0xE2){_tc=0x44FF44;}\
-            gfx_print(wx+16,_ty,_tc,term_lines[_i]); _ty+=16;\
+            gfx_print(wx+16,_ty,_tc,term_lines[_i]); _ty+=20;\
         }\
     } while(0)
 
@@ -1526,6 +2048,73 @@ redraw_desktop:
         for(_ci=0;_ci<chat_pos&&_ci<36;_ci++)_cb[_cn++]=chat_buf[_ci];\
         _cb[_cn]=0;\
         gfx_print(wx+16,wy+44+wh-56-16,0xBB88FF,_cb);\
+        /* Mic button + STT recorder UI */\
+        if (stt_active) {\
+            int _riy = wy+44+wh-56-16-24;\
+            gfx_fill_round_rect(wx+16,_riy,ww-32,20,4,0x220000);\
+            gfx_round_rect(wx+16,_riy,ww-32,20,4,0xFF4444);\
+            gfx_print(wx+22,_riy+2,0xFF6666, stt_train ? "● TRAIN — ripeti la frase scritta qui" : "● REC");\
+            int _bars = 12; int _bw = 6, _gap = 5;\
+            int _bx = wx + ww - 40 - (_bars*(_bw+_gap));\
+            int _step = (stt_ticks/8) % _bars;\
+            for (int _bi=0;_bi<_bars;_bi++){\
+                int _bh = 4 + ((_bi*7 + stt_ticks/4) % 13);\
+                uint32_t _bc = (_bi==_step) ? 0xFFAA44 : 0x88FF88;\
+                gfx_rect(_bx+_bi*(_bw+_gap), _riy+16-_bh, _bw, _bh, _bc);\
+            }\
+            gfx_print(wx+22, _riy+22, 0x3A5A6A, "[Invio] stop  [Esc] annulla");\
+        } else {\
+            int _mby = wy+44+wh-56-18;\
+            int _mbx = wx+ww-42;\
+            gfx_fill_round_rect(_mbx,_mby,30,20,6, stt_train?0x4A2A0A:0x1A1A4A);\
+            gfx_round_rect(_mbx,_mby,30,20,6, stt_train?0xFFAA44:0x3A5A8A);\
+            gfx_fill_round_rect(_mbx+11,_mby+2,8,10,4, stt_train?0xFFAA44:0x88BBFF);\
+            gfx_rect(_mbx+6,_mby+11,18,2, stt_train?0xFFAA44:0x88BBFF);\
+            gfx_print(_mbx-1, _mby+21, 0x3A4A6A, stt_train?"[Ctrl+T]":"[Ctrl+K]");\
+        }\
+    } while(0)
+
+    // Invia il contenuto di chat_buf a OreoAI via proxy seriale
+    #define chat_submit() do {\
+        chat_buf[chat_pos] = 0;\
+        if (chat_pos > 0) {\
+            chat_add(""); /* blank to separate */\
+            char _tmp[80]; int _ti;\
+            for(_ti=0;chat_buf[_ti];_ti++) _tmp[_ti]=chat_buf[_ti];\
+            _tmp[_ti]=0;\
+            chat_add(_tmp);\
+            int _got = 0;\
+            while (serial_available()) serial_read();\
+            serial_puts("AI|");\
+            serial_puts(_tmp);\
+            serial_write('\n');\
+            for (int _tw = 0; _tw < 30000; _tw++) {\
+                if (serial_available()) break;\
+                for (volatile int _d = 0; _d < 300000; _d++);\
+            }\
+            if (serial_available()) {\
+                char _rline[200];\
+                while (1) {\
+                    int _ri = 0;\
+                    while (_ri < 199) {\
+                        if (!serial_read_timeout(&_rline[_ri], 5000)) break;\
+                        if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;\
+                        _ri++;\
+                    }\
+                    _rline[_ri] = 0;\
+                    if (_rline[0]=='E'&&_rline[1]=='N'&&_rline[2]=='D'&&_rline[3]==0) break;\
+                    if (_rline[0]=='R'&&_rline[1]=='E'&&_rline[2]=='S'&&_rline[3]=='P'&&_rline[4]=='|') {\
+                        char *_rt = _rline + 5;\
+                        if (_rt[0]) { chat_add(_rt); _got = 1; }\
+                    }\
+                }\
+            }\
+            if (!_got) {\
+                chat_add("[AI proxy not connected. Run: python3 social_proxy.py]");\
+            }\
+        }\
+        chat_pos = 0; chat_buf[0] = 0;\
+        chat_redraw();\
     } while(0)
 
 #define calc_redraw() do {\
@@ -1604,20 +2193,8 @@ redraw_desktop:
         }\
     } while(0)
 
+    christmas_cursor = _natal_mode;
     draw_cursor();
-    // Snowflake cursor in Christmas mode
-    if (_natal_mode) {
-        int _cmx = mouse_get_x(), _cmy = mouse_get_y();
-        gfx_putpixel(_cmx, _cmy-4, 0xFFFFFF);
-        gfx_putpixel(_cmx, _cmy+4, 0xFFFFFF);
-        gfx_putpixel(_cmx-4, _cmy, 0xFFFFFF);
-        gfx_putpixel(_cmx+4, _cmy, 0xFFFFFF);
-        gfx_putpixel(_cmx-3, _cmy-3, 0xFFFFFF);
-        gfx_putpixel(_cmx+3, _cmy+3, 0xFFFFFF);
-        gfx_putpixel(_cmx-3, _cmy+3, 0xFFFFFF);
-        gfx_putpixel(_cmx+3, _cmy-3, 0xFFFFFF);
-        gfx_putpixel(_cmx, _cmy, 0xFFFF44);
-    }
     mouse_poll();
 
     // Debug: USB count + AC97 status
@@ -1626,66 +2203,207 @@ redraw_desktop:
     extern int ac97_is_init(void);
     gfx_print_shadow(48, 4, ac97_is_init() ? 0x00FF00 : 0xFF4444, ac97_is_init() ? "A:OK" : "A:NO");
 
+    // If the Home menu was just opened, draw it over the freshly redrawn desktop
+    if (home_active) draw_home(w, h, 0);
+
     char k;
     while (1) {
-        mouse_poll();
+    // Launch an app after a full desktop redraw (Home overlay path)
+    if (_pending_launch) {
+        int _pla = _pending_launch;
+        _pending_launch = 0;
+        _launch_app(_pla);
+    }
+    mouse_poll();
         net_poll_all();
+        int k_ctrl = 0;
+        christmas_cursor = _natal_mode;
         draw_cursor();
-        if (_natal_mode) {
-            int _cmx = mouse_get_x(), _cmy = mouse_get_y();
-            gfx_putpixel(_cmx, _cmy-4, 0xFFFFFF);
-            gfx_putpixel(_cmx, _cmy+4, 0xFFFFFF);
-            gfx_putpixel(_cmx-4, _cmy, 0xFFFFFF);
-            gfx_putpixel(_cmx+4, _cmy, 0xFFFFFF);
-            gfx_putpixel(_cmx-3, _cmy-3, 0xFFFFFF);
-            gfx_putpixel(_cmx+3, _cmy+3, 0xFFFFFF);
-            gfx_putpixel(_cmx-3, _cmy+3, 0xFFFFFF);
-            gfx_putpixel(_cmx+3, _cmy-3, 0xFFFFFF);
-            gfx_putpixel(_cmx, _cmy, 0xFFFF44);
-        }
         // Dock hover magnification + click
         static int _pdh = -2;
         int _mhx = mouse_get_x(), _mhy = mouse_get_y();
         int _ddcx = w/2 - 320, _ddcy = h - 70, _dhov = -1;
         int _dhbase = _ddcx + (640 - 9*56)/2;
-        if (_mhy >= _ddcy - 5) {
+        if (!home_active && !oem_active && _mhy >= _ddcy - 5) {
             for (int _di = 0; _di < 9; _di++) {
                 int _ix = _dhbase + _di*56;
                 if (_mhx >= _ix && _mhx <= _ix + 40) { _dhov = _di; break; }
             }
         }
-        if (_dhov >= 0) {
+        if (!win && _dhov >= 0) {
             int _hx = _dhbase + _dhov*56;
-            uint32_t _mcols[] = {0xCC44AA,0x2A2A3A,0x4A4A5A,0x5A3A8A,0x3A3A4A,0xDDAA33,0x4488FF,0x6A8ABE,0x3A1A5A,0xFFFFFF};
-            const char *_dinit[] = {"G","T","S","O","C","N","A","W","T","W"};
+            /* macOS-style glow behind the hovered icon */
+            gfx_fill_round_rect(_hx-1, _ddcy+7, 42, 42, 12, 0x16224A);
+            gfx_rect_alpha(_hx-3, _ddcy+5, 46, 46, 0x4A8AFF, 9);
+            gfx_rect_alpha(_hx-7, _ddcy+1, 54, 54, 0x3B82F6, 4);
+            /* active-app indicator dot (macOS) */
+            gfx_fill_round_rect(_hx+13, _ddcy+52, 14, 4, 2, 0xFFFFFF);
+            gfx_fill_round_rect(_hx+16, _ddcy+52, 8, 3, 2, 0x99BBFF);
             const char *_dnm[] = {"Games","Terminal","Settings","OreoAI","Calculator","Notes","App Store","Weather","Tetris","Wii Menu"};
-            /* Glow ring behind magnified icon */
-            for (int _gi = 4; _gi > 0; _gi--) {
-                int _ga = 4 - _gi;
-                uint32_t _gl = (_ga*0x220000)|(_ga*0x002200)|(_ga*0x008800);
-                gfx_round_rect(_hx - 9 - _gi, _ddcy - 12 - _gi, 58 + _gi*2, 58 + _gi*2, 16 + _gi, _gl);
-            }
-            int _msz = 54, _mx = _hx - 7, _my = _ddcy - 10;
-            gfx_fill_round_rect(_mx+3, _my+3, _msz, _msz, 14, 0x000000);
-            gfx_fill_round_rect(_mx, _my, _msz, _msz, 14, _mcols[_dhov]);
-            gfx_round_rect(_mx, _my, _msz, _msz, 14, 0x88BBFF);
-            gfx_print_scaled(_mx+12, _my+10, 0xFFFFFF, _dinit[_dhov], 3);
             const char *_dn = _dnm[_dhov]; int _dl = 0; while(_dn[_dl]) _dl++;
             int _dx = _hx + 20 - _dl*4;
             if (_dx < 4) _dx = 4; if (_dx + _dl*8 > w-4) _dx = w-4 - _dl*8;
-            gfx_fill_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x0A0A2A);
-            gfx_round_rect(_dx-6, _my-24, _dl*8+12, 16, 4, 0x3A5A8A);
-            gfx_print_shadow(_dx, _my-22, 0xFFFFFF, _dn);
+            gfx_fill_round_rect(_dx-6, _ddcy-36, _dl*8+12, 18, 9, 0x101022);
+            gfx_round_rect(_dx-6, _ddcy-36, _dl*8+12, 18, 9, 0x3A5A8A);
+            gfx_print_shadow(_dx, _ddcy-34, 0xFFFFFF, _dn);
         }
         // Capture click BEFORE hover redraw so we don't lose it
-        if (mouse_clicked() && !win && !cc_active && !nc_active && _dhov >= 0) {
+        if (mouse_clicked() && !win && !home_active && !oem_active && !cc_active && !nc_active && !wifi_active) {
+            int _hmx = mouse_get_x(), _hmy = mouse_get_y();
+            int _hb_x = w/2 - 396, _hb_y = h - 66;
+            if (_hmx >= _hb_x && _hmx < _hb_x + 56 && _hmy >= _hb_y && _hmy < _hb_y + 52) {
+                open_home();
+                goto redraw_desktop;
+            }
+        }
+        if (mouse_clicked() && !win && !home_active && !oem_active && !cc_active && !nc_active && !wifi_active && _dhov >= 0) {
             const char *_dkmap = "k345678wgz";
             char _dc = _dkmap[_dhov];
             if (_dc) { k = _dc; goto _dock_go; }
         }
-        if (_dhov != _pdh) { _pdh = _dhov; goto redraw_desktop; }
+        if (mouse_clicked() && !win && !home_active && !oem_active && !cc_active && !nc_active && !wifi_active) {
+            int _mxx = mouse_get_x(), _mxy = mouse_get_y();
+            if (_mxy < 24) {
+                if (_mxx >= wifi_icon_x && _mxx < wifi_icon_x + 16) {
+                    cc_active = 0; nc_active = 0;
+                    wifi_active = 1; wifi_sel = 0;
+                    wifi_request_scan();
+                    goto redraw_desktop;
+                }
+                if (_mxx >= cc_icon_x && _mxx < cc_icon_x + 12) {
+                    nc_active = 0; cc_active = !cc_active; cc_sel = 0; wifi_active = 0;
+                    if (!cc_active) goto redraw_desktop;
+                    goto redraw_desktop;
+                }
+                if (_mxx >= nc_icon_x && _mxx < nc_icon_x + 14) {
+                    cc_active = 0; nc_active = !nc_active; nc_sel = 0; wifi_active = 0;
+                    if (!nc_active) goto redraw_desktop;
+                    goto redraw_desktop;
+                }
+            }
+        }
+        if (!win && !home_active && !oem_active && _dhov != _pdh) { _pdh = _dhov; goto redraw_desktop; }
         k = keyboard_last_char();
+        k_ctrl = keyboard_last_ctrl() || is_ctrl_pressed();
+        if (k) {
+            extern void ac97_play_click(void);
+            extern void ac97_play_confirm(void);
+            ac97_play_click();
+        }
 _dock_go:
+
+        // ─── HOME START MENU (compact panel) ───
+        if (home_active) {
+            int _px = 8, _pw = HOME_PW, _py = h - 70 - HOME_PH, _ph = HOME_PH;
+            if (mouse_clicked()) {
+                int _hmx = mouse_get_x(), _hmy = mouse_get_y();
+                if (_hmx >= _px + _pw - 44 && _hmx < _px + _pw - 8 && _hmy >= _py + 8 && _hmy < _py + 44) {
+                    home_active = 0; goto redraw_desktop;
+                }
+                int _gx = _px + 16;
+                int _colw = 56, _isz = 36;
+                int _gr = (_hmx - _gx) / _colw, _gc = (_hmx - _gx) % _colw;
+                int _row = (_hmy - (_py + 66)) / 56;
+                if (_gr >= 0 && _gr < HOME_COLS && _row >= 0 && _row < HOME_VROWS) {
+                    int _idx = (_row + home_scroll) * HOME_COLS + _gr;
+                    if (_idx >= 0 && _idx < HOME_APP_COUNT &&
+                        _hmx >= _gx + _gr * _colw && _hmx < _gx + _gr * _colw + _colw &&
+                        _hmy >= _py + 66 + _row * 56 && _hmy < _py + 66 + _row * 56 + 56) {
+                        home_active = 0;
+                        _pending_launch = home_app_act[_idx];
+                        goto redraw_desktop;
+                    }
+                }
+                int _dx = _gx + HOME_COLS * _colw + 8;
+                int _sx = _dx + 20, _sw = _px + _pw - 12 - _sx;
+                int _it_h = 50, _iy = _py + 82;
+                if (_hmx >= _sx - 4 && _hmx < _sx + _sw + 8 && _hmy >= _iy - 4 && _hmy < _iy + _it_h + 8) {
+                    home_active = 0; oem_active = 1;
+                    draw_oem_bios(w, h);
+                    continue;
+                }
+                if (bootloader_unlocked) {
+                    int _iy2 = _iy + _it_h + 10;
+                    if (_hmx >= _sx - 4 && _hmx < _sx + _sw + 8 && _hmy >= _iy2 - 4 && _hmy < _iy2 + _it_h + 8) {
+                        home_active = 0;
+                        _pending_launch = 37;
+                        goto redraw_desktop;
+                    }
+                }
+                if (_hmx < _px || _hmx >= _px + _pw || _hmy < _py || _hmy >= _py + _ph) {
+                    home_active = 0; goto redraw_desktop;
+                }
+                draw_home(w, h, 0);
+                continue;
+            }
+            if (k == 27) { home_active = 0; goto redraw_desktop; }
+            if (k == '\t') { home_focus = !home_focus; draw_home(w, h, 0); continue; }
+            if (home_focus == 0) {
+                if (k == KEY_UP && home_sel >= HOME_COLS) {
+                    home_sel -= HOME_COLS;
+                    if (home_sel / HOME_COLS < home_scroll) home_scroll = home_sel / HOME_COLS;
+                    draw_home(w, h, 0); continue;
+                }
+                if (k == KEY_DOWN && home_sel + HOME_COLS < HOME_APP_COUNT) {
+                    home_sel += HOME_COLS;
+                    if (home_sel / HOME_COLS >= home_scroll + HOME_VROWS) home_scroll = home_sel / HOME_COLS - HOME_VROWS + 1;
+                    draw_home(w, h, 0); continue;
+                }
+                if (k == KEY_LEFT && home_sel > 0) { home_sel--; draw_home(w, h, 0); continue; }
+                if (k == KEY_RIGHT && home_sel < HOME_APP_COUNT - 1) { home_sel++; draw_home(w, h, 0); continue; }
+                if (k == '\n' || k == ' ') { home_active = 0; _pending_launch = home_app_act[home_sel]; goto redraw_desktop; }
+            } else {
+                if (k == KEY_UP && home_sys_sel > 0) { home_sys_sel--; draw_home(w, h, 0); continue; }
+                if (k == KEY_DOWN && home_sys_sel < (bootloader_unlocked ? 1 : 0)) { home_sys_sel++; draw_home(w, h, 0); continue; }
+                if (k == '\n' || k == ' ') {
+                    home_active = 0;
+                    if (home_sys_sel == 0) { oem_active = 1; draw_oem_bios(w, h); continue; }
+                    else if (bootloader_unlocked) { _pending_launch = 37; goto redraw_desktop; }
+                    continue;
+                }
+            }
+            if (!k) { asm volatile("hlt"); continue; }
+            continue;
+        }
+
+        // ─── OEM UNLOCKER — KAIRO BLUE BIOS ───
+        if (oem_active) {
+            if (mouse_clicked()) {
+                int _hmx = mouse_get_x(), _hmy = mouse_get_y();
+                if (_hmx >= w/2 - 120 && _hmx < w/2 + 120 && _hmy >= h - 110 && _hmy < h - 66) {
+                    oem_do_unlock();
+                    goto redraw_desktop;
+                }
+            }
+            if (k == 27) { oem_active = 0; goto redraw_desktop; }
+            if (k == '1' || k == '\n') { oem_do_unlock(); goto redraw_desktop; }
+            if (!k) { asm volatile("hlt"); continue; }
+            continue;
+        }
+
+        // ─── Drag finestra (window_t, title bar) ───
+        if (win && g_win_title && (mouse_get_buttons() & 1)) {
+            int _mhx = mouse_get_x(), _mhy = mouse_get_y();
+            int _th = renderer_window_title_h(g_win_title);
+            if (g_win.dragging ||
+                (_mhy >= wy && _mhy < wy + _th && _mhx >= wx && _mhx < wx + ww)) {
+                int _ox = wx, _oy = wy;
+                g_win.x = wx; g_win.y = wy; g_win.w = ww; g_win.h = wh;
+                window_handle_input(&g_win, _mhx, _mhy, mouse_get_buttons());
+                if (g_win.x != _ox || g_win.y != _oy) {
+                    wx = g_win.x; wy = g_win.y;
+                    restore_win_area(_ox, _oy, ww, wh);
+                    open_app_redraw();
+                    draw_mac_title(g_win_title);
+                    win_content_redraw();
+                    continue;
+                }
+            } else {
+                g_win.dragging = 0;
+            }
+        } else if (win) {
+            g_win.dragging = 0;
+        }
 
         // ─── AI Command Mode Overlay ───
         if (ai_active) {
@@ -1899,26 +2617,68 @@ _dock_go:
             continue;
         }
 
+        // ─── Wi-Fi panel (rete reale via proxy) ───
+        if (wifi_active) {
+            int _wxp = wifi_icon_x - 150, _wyp = 24, _wwp = 210, _whp = 24 + 26*6 + 30;
+            if (_wxp < 30) _wxp = 30;
+            if (_wxp + _wwp > w - 10) _wxp = w - 10 - _wwp;
+            gfx_rect(0,0,w,24,0x0A0A1C); gfx_rect(0,23,w,1,0x1A1A3A);
+            gfx_print(10,5,0x8899CC,"Viteza");
+            gfx_fill_round_rect(_wxp,_wyp,_wwp,_whp,8,0x0E0E30);
+            gfx_round_rect(_wxp,_wyp,_wwp,_whp,8,0x4488FF);
+            gfx_rect(_wxp+8,_wyp+32,_wwp-16,1,0x2A3A6A);
+            gfx_print(_wxp+16,_wyp+10,0x8899CC,"Wi-Fi Networks");
+            if (wifi_connected) {
+                gfx_print(_wxp+16,_wyp+40,0x44FF44,"Connected");
+            } else if (wifi_count == 0 && wifi_scan_done) {
+                gfx_print(_wxp+16,_wyp+40,0xCC4444,"No networks / proxy offline");
+            } else if (wifi_count == 0) {
+                gfx_print(_wxp+16,_wyp+40,0x6A7A9E,"Scanning...");
+            } else {
+                int _vis = wifi_count < 6 ? wifi_count : 6;
+                int _wtop = (wifi_sel >= _vis) ? wifi_sel - _vis + 1 : 0;
+                for(int _wi=_wtop;_wi<wifi_count&&_wi<_wtop+_vis;_wi++){
+                    int _wiy = _wyp+40+(_wi-_wtop)*26;
+                    if(_wi==wifi_sel)gfx_fill_round_rect(_wxp+4,_wiy-2,_wwp-8,22,4,0x1A2A5A);
+                    int _bs = wifi_bars(wifi_sig[_wi]);
+                    for(int _b=0;_b<4;_b++){int _bh=(_b<_bs)?(3+_b*3):2;gfx_rect(_wxp+14+_b*8,_wiy+14-_bh,4,_bh,_wi==wifi_sel?0x4488FF:0x6A7A9E);}
+                    if(wifi_sec[_wi]){gfx_rect(_wxp+46,_wiy+3,8,5,0x6A7A9E);gfx_rect(_wxp+44,_wiy+8,12,8,0x6A7A9E);}
+                    gfx_print(_wxp+60,_wiy+3,(_wi==wifi_sel)?0xFFFFFF:0x8A9ACE,wifi_names[_wi]);
+                    char _rs[6];int _ri2=0,_rn2=wifi_sig[_wi];if(_rn2<0){_rs[_ri2++]='-';_rn2=-_rn2;}
+                    do{_rs[_ri2++]='0'+_rn2%10;_rn2/=10;}while(_rn2);_rs[_ri2]=0;
+                    for(int _rk=0;_rk<_ri2/2;_rk++){char _rt=_rs[_rk];_rs[_rk]=_rs[_ri2-1-_rk];_rs[_ri2-1-_rk]=_rt;}
+                    gfx_print(_wxp+_wwp-30,_wiy+3,0x4A5A7E,_rs);
+                }
+            }
+            gfx_print(_wxp+10,_wyp+_whp-18,0x3A4A6A,"[U/D] select  [Enter] connect  [Esc]");
+            if(k==27){wifi_active=0;goto redraw_desktop;}
+            if(k==KEY_UP&&wifi_sel>0){wifi_sel--;continue;}
+            if(k==KEY_DOWN&&wifi_sel<wifi_count-1){wifi_sel++;continue;}
+            if(k=='\n'&&wifi_count>0){wifi_connected=1;continue;}
+            if(!k){asm volatile("hlt");continue;}
+            continue;
+        }
+
         // ─── System Ctrl Shortcuts ───
         if (!cmd_active && !ai_active) {
-            if (is_ctrl_pressed() && k == ' ') {
+            if (k_ctrl && k == ' ') {
                 ai_active = 1; ai_pos = 0; ai_buf[0] = 0; ai_response = 0;
                 continue;
             }
-            if (is_ctrl_pressed() && k == 'c') {
+            if (k_ctrl && k == 'c') {
                 if (win) { close_win(); }
-                nc_active = 0; cc_active = !cc_active; cc_sel = 0;
+                nc_active = 0; cc_active = !cc_active; cc_sel = 0; wifi_active = 0;
                 if (!cc_active) goto redraw_desktop;
                 continue;
             }
-            if (is_ctrl_pressed() && k == 'n') {
+            if (k_ctrl && k == 'n') {
                 if (win) { close_win(); }
-                cc_active = 0; nc_active = !nc_active; nc_sel = 0;
+                cc_active = 0; nc_active = !nc_active; nc_sel = 0; wifi_active = 0;
                 if (!nc_active) goto redraw_desktop;
                 continue;
             }
             // Ctrl+Shift+P → Command Palette
-            if (is_ctrl_pressed() && k == 'P') {
+            if (k_ctrl && k == 'P') {
                 cmd_active = 1; cmd_pos = 0; cmd_buf[0] = 0;
                 if (win) { close_win(); }
                 continue;
@@ -1965,11 +2725,11 @@ _dock_go:
 
         // ─── WINDOW IS OPEN ───
         if (win) {
-            if ((k == 27 || k == 'q' || (is_ctrl_pressed() && k == 'w')) && win_type != 3 && win_type != 5) { close_win(); search_focus = 1; goto redraw_desktop; }
+            if ((k == 27 || k == 'q' || (k_ctrl && k == 'w')) && win_type != 3 && win_type != 5) { close_win(); search_focus = 1; goto redraw_desktop; }
 
             // Terminal input
             if (win_type == 3) {
-                if (k == 27 || k == 'q' || (is_ctrl_pressed() && k == 'w')) { close_win(); search_focus = 1; goto redraw_desktop; }
+                if (k == 27 || k == 'q' || (k_ctrl && k == 'w')) { close_win(); search_focus = 1; goto redraw_desktop; }
                 if (k == KEY_UP && term_scroll > 0) { term_scroll--; term_redraw(); continue; }
                 if (k == KEY_DOWN && term_scroll < term_line_count-1) { term_scroll++; term_redraw(); continue; }
                 if (k == '\n') {
@@ -1993,7 +2753,30 @@ _dock_go:
                         } else if (term_buf[0]=='v'&&term_buf[1]=='e'&&term_buf[2]=='r'&&!term_buf[3]) {
                             term_add("Viteza Kernel v1.0 (x86_64)","");
                         } else if (term_buf[0]=='d'&&term_buf[1]=='a'&&term_buf[2]=='t'&&term_buf[3]=='e'&&!term_buf[4]) {
-                            term_add("Sun Jun 28 2026","");
+                            int _dy=0,_dm=0,_dd=0,_dw=0; rtc_read_full(&_dy,&_dm,&_dd,&_dw);
+                            int _dhs2=0,_dms2=0,_dss2=0; rtc_read_time(&_dhs2,&_dms2,&_dss2);
+                            const char *_dmnames[12]={"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+                            const char *_dwnames[7]={"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+                            const char *_dn = (_dw>=1&&_dw<=7) ? _dwnames[_dw-1] : _dwnames[0];
+                            char _dbuf[48]; int _dbi=0,_dx;
+                            while((_dn[_dbi])){_dbuf[_dbi]=_dn[_dbi];_dbi++;}
+                            _dbuf[_dbi++]=' ';
+                            const char *_mo=_dmnames[(_dm>=1&&_dm<=12)?_dm-1:0];
+                            for(_dx=0;_mo[_dx];_dx++)_dbuf[_dbi++]=_mo[_dx];
+                            _dbuf[_dbi++]=' ';
+                            if(_dd<10)_dbuf[_dbi++]='0';
+                            if(_dd>=100){_dbuf[_dbi++]='0'+_dd/100;_dd%=100;}
+                            _dbuf[_dbi++]='0'+_dd/10;_dbuf[_dbi++]='0'+_dd%10;
+                            _dbuf[_dbi++]=' ';
+                            if(_dy>=1000){_dbuf[_dbi++]='0'+_dy/1000;_dy%=1000;}
+                            _dbuf[_dbi++]='0'+_dy/100;_dy%=100;
+                            _dbuf[_dbi++]='0'+_dy/10;_dbuf[_dbi++]='0'+_dy%10;
+                            _dbuf[_dbi++]=' ';
+                            _dbuf[_dbi++]='0'+_dhs2/10;_dbuf[_dbi++]='0'+_dhs2%10;_dbuf[_dbi++]=':';
+                            _dbuf[_dbi++]='0'+_dms2/10;_dbuf[_dbi++]='0'+_dms2%10;_dbuf[_dbi++]=':';
+                            _dbuf[_dbi++]='0'+_dss2/10;_dbuf[_dbi++]='0'+_dss2%10;
+                            _dbuf[_dbi]=0;
+                            term_add(_dbuf,0);
                         } else if (term_buf[0]=='n'&&term_buf[1]=='e'&&term_buf[2]=='o'&&term_buf[3]=='f'&&term_buf[4]=='e'&&term_buf[5]=='t'&&term_buf[6]=='c'&&term_buf[7]=='h'&&!term_buf[8]) {
                             term_add("OS: Viteza v1.0","");term_add("Kernel: x86_64 Long Mode","");
                             term_add("WM: OreoWM (built-in)","");term_add("RAM: 256 MB","");
@@ -2042,55 +2825,170 @@ _dock_go:
 
             // OreoAI input
             if (win_type == 5) {
-                if (k == 27 || k == 'q' || (is_ctrl_pressed() && k == 'w')) { close_win(); search_focus = 1; goto redraw_desktop; }
-                if (k == KEY_UP && chat_scroll > 0) { chat_scroll--; chat_redraw(); continue; }
-                if (k == KEY_DOWN && chat_scroll < chat_line_count-1) { chat_scroll++; chat_redraw(); continue; }
-                if (k == '\n') {
-                    chat_buf[chat_pos] = 0;
-                    if (chat_pos > 0) {
-                        chat_add(""); // blank to separate
-                        char _tmp[80]; int _ti;
-                        for(_ti=0;chat_buf[_ti];_ti++) _tmp[_ti]=chat_buf[_ti];
-                        _tmp[_ti]=0;
-                        chat_add(_tmp);
-                        // Try AI via serial proxy
-                        int _got = 0;
-                        while (serial_available()) serial_read();
-                        serial_puts("AI|");
-                        serial_puts(_tmp);
-                        serial_write('\n');
-                        // Wait for response with timeout
-                        for (int _tw = 0; _tw < 30000; _tw++) {
-                            if (serial_available()) break;
-                            for (volatile int _d = 0; _d < 300000; _d++);
-                        }
-                        if (serial_available()) {
-                            char _rline[200];
-                            while (1) {
-                                int _ri = 0;
-                                while (_ri < 199) {
-                                    if (!serial_read_timeout(&_rline[_ri], 5000)) break;
-                                    if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;
-                                    _ri++;
-                                }
-                                _rline[_ri] = 0;
-                                if (_rline[0]=='E'&&_rline[1]=='N'&&_rline[2]=='D'&&_rline[3]==0) break;
-                                if (_rline[0]=='R'&&_rline[1]=='E'&&_rline[2]=='S'&&_rline[3]=='P'&&_rline[4]=='|') {
-                                    char *_rt = _rline + 5;
-                                    if (_rt[0]) { chat_add(_rt); _got = 1; }
-                                }
-                            }
-                        }
-                        if (!_got) {
-                            chat_add("[AI proxy not connected. Run: python3 social_proxy.py]");
-                        }
-                    }
-                    chat_pos = 0; chat_buf[0] = 0;
+                // Durante la registrazione STT, Esc = annulla
+                if (k == 27 && stt_active) {
+                    while (serial_available()) serial_read();
+                    serial_puts("STT|ABORT\n");
+                    stt_active = 0; stt_train = 0;
                     chat_redraw();
                     continue;
                 }
+                if (k == 27 || k == 'q' || (k_ctrl && k == 'w')) { close_win(); search_focus = 1; goto redraw_desktop; }
+                if (k == KEY_UP && chat_scroll > 0) { chat_scroll--; chat_redraw(); continue; }
+                if (k == KEY_DOWN && chat_scroll < chat_line_count-1) { chat_scroll++; chat_redraw(); continue; }
+
+                // Toggle training mode (Ctrl+T)
+                if (k_ctrl && k == 't') {
+                    stt_train = !stt_train;
+                    chat_redraw();
+                    continue;
+                }
+
+                // Avvia/ferma registrazione: bottone mic o Ctrl+K
+                int _mbx = wx+ww-42, _mby = wy+44+wh-56-18;
+                int _toggle = (k_ctrl && k == 'k') ||
+                              (mouse_clicked() && mouse_get_x() >= _mbx && mouse_get_x() < _mbx+30 &&
+                               mouse_get_y() >= _mby && mouse_get_y() < _mby+20);
+                if (_toggle && !stt_active) {
+                    while (serial_available()) serial_read();
+                    if (stt_train) {
+                        char _tph[80]; int _ti;
+                        for (_ti=0; chat_buf[_ti] && _ti<79; _ti++) _tph[_ti]=chat_buf[_ti];
+                        _tph[_ti]=0;
+                        if (_ti == 0) { const char *_d = "ciao oreo";
+                            for (_ti=0; _d[_ti]; _ti++) _tph[_ti]=_d[_ti]; _tph[_ti]=0; }
+                        serial_puts("STT|TRAIN|"); serial_puts(_tph); serial_write('\n');
+                    } else {
+                        serial_puts("STT|START\n");
+                    }
+                    stt_active = 1; stt_ticks = 0;
+                    chat_redraw();
+                    continue;
+                }
+
+                // Stop registrazione STT: ricevi il PCM dal proxy, riconosci nel
+                // kernel (DTW nativo + template di sessione); se fallisce, invia
+                // l'audio al proxy per la dettatura Apple Speech
+                if (stt_active && k == '\n') {
+                    int _is_train = stt_train;
+                    char _tph[80]; int _tlen;
+                    for (_tlen=0; chat_buf[_tlen] && _tlen<79; _tlen++) _tph[_tlen]=chat_buf[_tlen];
+                    _tph[_tlen]=0;
+                    if (_tlen == 0) { const char *_d = "ciao oreo";
+                        for (_tlen=0; _d[_tlen]; _tlen++) _tph[_tlen]=_d[_tlen]; _tph[_tlen]=0; }
+                    while (serial_available()) serial_read();
+                    serial_puts("STT|STOP\n");
+                    int _got_pcm = 0, _n16 = 0;
+                    for (int _tw = 0; _tw < 30000; _tw++) {
+                        if (serial_available()) break;
+                        for (volatile int _d = 0; _d < 300000; _d++);
+                    }
+                    if (serial_available()) {
+                        char _rline[200]; int _ri = 0;
+                        while (_ri < 199) {
+                            if (!serial_read_timeout(&_rline[_ri], 5000)) break;
+                            if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;
+                            _ri++;
+                        }
+                        _rline[_ri] = 0;
+                        serial_puts("STTDBG|hdr="); serial_puts(_rline); serial_write('\n');
+                        if (_rline[0]=='S'&&_rline[1]=='T'&&_rline[2]=='T'&&_rline[3]=='|'&&
+                            _rline[4]=='P'&&_rline[5]=='C'&&_rline[6]=='M'&&_rline[7]=='|') {
+                            int _v = 0, _p = 8;
+                            while (_rline[_p] >= '0' && _rline[_p] <= '9') { _v = _v*10 + (_rline[_p]-'0'); _p++; }
+                            _n16 = _v;
+                            if (_n16 > 80000) _n16 = 80000;
+                            _got_pcm = 1;
+                        }
+                    }
+                    if (_got_pcm && _n16 > 0) {
+                        int _got16 = serial_read_bulk((char *)stt_tmp_mono, _n16 * 2, 40000000) / 2;
+                        _n16 = _got16;
+                        serial_puts("STTDBG|rx="); serial_dec(_n16); serial_write('\n');
+                        long _sum = 0;
+                        for (int _s = 0; _s < _n16; _s++) _sum += stt_tmp_mono[_s];
+                        serial_puts("STTDBG|sum="); serial_dec((int)_sum); serial_write('\n');
+                    }
+                    stt_active = 0; stt_train = 0;
+                    if (_got_pcm && _n16 > 4000) {
+                        if (_is_train) {
+                            int _sidx = stt_train_pcm16(stt_tmp_mono, _n16, (const char*)_tph);
+                            serial_puts("STTDBG|train=");
+                            serial_puts((const char*)_tph);
+                            serial_puts("|sess="); serial_dec(_sidx); serial_write('\n');
+                            if (_sidx >= 0) {
+                                int _j; for (_j=0; _tph[_j] && _j<127; _j++) chat_buf[_j]=(char)_tph[_j];
+                                chat_buf[_j]=0; chat_pos=_j;
+                                chat_submit();
+                            } else {
+                                chat_redraw();
+                            }
+                        } else {
+                            int _idx = stt_recognize_pcm16(stt_tmp_mono, _n16);
+                            serial_puts("STTDBG|n="); serial_dec(_n16);
+                            serial_puts("|idx="); serial_dec(_idx);
+                            serial_puts("|dist="); serial_dec((int)(stt_last_dist * 1000.0));
+                            serial_puts("|best="); serial_dec(stt_last_best); serial_write('\n');
+                            if (_idx >= 0) {
+                                const char *_ph = stt_phrase_name(_idx);
+                                int _j; for (_j=0; _ph[_j] && _j<127; _j++) chat_buf[_j]=_ph[_j];
+                                chat_buf[_j]=0; chat_pos=_j;
+                                chat_submit();
+                            } else {
+                                // Fallback: invia audio al proxy per la dettatura Apple Speech
+                                int _got = 0;
+                                char _resp[160] = {0};
+                                while (serial_available()) serial_read();
+                                serial_puts("STT|AUDIO|16000|1|");
+                                serial_dec(_n16); serial_write('\n');
+                                for (int _i = 0; _i < _n16; _i++) {
+                                    serial_write((char)(stt_tmp_mono[_i] & 0xFF));
+                                    serial_write((char)((stt_tmp_mono[_i] >> 8) & 0xFF));
+                                }
+                                for (int _tw = 0; _tw < 30000; _tw++) {
+                                    if (serial_available()) break;
+                                    for (volatile int _d = 0; _d < 300000; _d++);
+                                }
+                                if (serial_available()) {
+                                    char _rline[200];
+                                    while (1) {
+                                        int _ri = 0;
+                                        while (_ri < 199) {
+                                            if (!serial_read_timeout(&_rline[_ri], 5000)) break;
+                                            if (_rline[_ri] == '\n' || _rline[_ri] == '\r') break;
+                                            _ri++;
+                                        }
+                                        _rline[_ri] = 0;
+                                        if (_rline[0]=='E'&&_rline[1]=='N'&&_rline[2]=='D'&&_rline[3]==0) break;
+                                        if (_rline[0]=='R'&&_rline[1]=='E'&&_rline[2]=='S'&&_rline[3]=='P'&&_rline[4]=='|') {
+                                            char *_rt = _rline + 5;
+                                            int _j; for (_j=0; _rt[_j] && _j<159; _j++) _resp[_j]=_rt[_j];
+                                            _resp[_j]=0;
+                                            if (_resp[0]) _got = 1;
+                                        }
+                                    }
+                                }
+                                if (_got) {
+                                    int _j; for (_j=0; _resp[_j] && _j<127; _j++) chat_buf[_j]=_resp[_j];
+                                    chat_buf[_j]=0; chat_pos=_j;
+                                    chat_submit();
+                                } else {
+                                    chat_redraw();
+                                }
+                            }
+                        }
+                    } else {
+                        chat_redraw();
+                    }
+                    continue;
+                }
+
+                if (k == '\n') { chat_submit(); continue; }
                 if (k == '\b' && chat_pos > 0) { chat_pos--; chat_buf[chat_pos] = 0; chat_redraw(); continue; }
                 if (chat_pos < 127 && k >= ' ' && k <= '~') { chat_buf[chat_pos++] = k; chat_buf[chat_pos] = 0; chat_redraw(); continue; }
+
+                // Animazione del registratore
+                if (stt_active) { stt_ticks++; chat_redraw(); }
                 if (!k) { asm volatile("hlt"); continue; }
                 continue;
             }
@@ -2310,7 +3208,7 @@ _dock_go:
                     studio_draw_all(); continue;
                 }
                 // Ctrl+R → Run via AI proxy
-                if (is_ctrl_pressed() && k == 'r') {
+                if (k_ctrl && k == 'r') {
                     studio_output_count = 0;
                     // Build full code string from buffer
                     char _send[512]; int _sp = 0;
@@ -2617,104 +3515,36 @@ _dock_go:
                     if (k == 's' && !camera_is_streaming()) { camera_start_stream(); continue; }
                     if (k == 's' && camera_is_streaming()) { camera_stop_stream(); continue; }
                 } else {
-                    // Simulated webcam — 3D city skyline
-                    #define _Wsin(_a) _ws[((_a)%256+256)%256]
-                    static const int _ws[256] = {0,6,12,18,25,31,37,43,49,56,62,68,74,80,86,92,97,103,109,115,120,126,131,136,142,147,152,157,162,167,171,176,181,185,189,193,197,201,205,209,212,216,219,222,225,228,231,234,236,238,241,243,244,246,248,249,251,252,253,254,254,255,255,255,256,255,255,255,254,254,253,252,251,249,248,246,244,243,241,238,236,234,231,228,225,222,219,216,212,209,205,201,197,193,189,185,181,176,171,167,162,157,152,147,142,136,131,126,120,115,109,103,97,92,86,80,74,68,62,56,49,43,37,31,25,18,12,6,0,-6,-12,-18,-25,-31,-37,-43,-49,-56,-62,-68,-74,-80,-86,-92,-97,-103,-109,-115,-120,-126,-131,-136,-142,-147,-152,-157,-162,-167,-171,-176,-181,-185,-189,-193,-197,-201,-205,-209,-212,-216,-219,-222,-225,-228,-231,-234,-236,-238,-241,-243,-244,-246,-248,-249,-251,-252,-253,-254,-254,-255,-255,-255,-256,-255,-255,-255,-254,-254,-253,-252,-251,-249,-248,-246,-244,-243,-241,-238,-236,-234,-231,-228,-225,-222,-219,-216,-212,-209,-205,-201,-197,-193,-189,-185,-181,-176,-171,-167,-162,-157,-152,-147,-142,-136,-131,-126,-120,-115,-109,-103,-97,-92,-86,-80,-74,-68,-62,-56,-49,-43,-37,-31,-25,-18,-12,-6};
-                    int _ca = _tick, _cx0 = _cfx+_cfw/2, _cy0 = _cfy+_cfh/2;
-                    int _sa = _Wsin(_ca), _caa = _Wsin(_ca+64);
-                    gfx_fill_round_rect(_cfx,_cfy,_cfw,_cfh,6,0x080818);
-                    // Ground plane (dark grid)
-                    for (int _gz = 50; _gz < 500; _gz += 30) {
-                        int _zx = (-_gz*_sa)>>8, _zz = (_gz*_caa+400)>>8;
-                        int _d2 = 500, _s2 = _d2*256/(_zz+_d2);
-                        int _gpx = _cx0 + (_zx*_s2>>8);
-                        int _gpy = _cy0 + 80 + (200*_s2>>8)/2;
-                        if (_gpx >= _cfx && _gpx < _cfx+_cfw && _gpy >= _cfy && _gpy < _cfy+_cfh)
-                            gfx_rect(_gpx-1,_gpy,3,1,0x1A2A4A);
+                    // Rec Room — DormRoom 3D
+                    static int _r3d_init_done = 0;
+                    static camera_t r3d_cam;
+                    if (!_r3d_init_done) {
+                        r3d_init(w, h);
+                        r3d_cam = (camera_t){{0, 1.5f, -2.5f}, 0, 0};
+                        _r3d_init_done = 1;
                     }
-                    // Buildings: pos_x, pos_z, width, depth, height, color
-                    int _nb = 12, _bd[72];
-                    _bd[0]=-120;_bd[1]=80;_bd[2]=40;_bd[3]=40;_bd[4]=120;_bd[5]=0x4488FF;
-                    _bd[6]=-60;_bd[7]=60;_bd[8]=30;_bd[9]=30;_bd[10]=200;_bd[11]=0xFF6644;
-                    _bd[12]=0;_bd[13]=70;_bd[14]=50;_bd[15]=50;_bd[16]=90;_bd[17]=0x44DD88;
-                    _bd[18]=70;_bd[19]=90;_bd[20]=35;_bd[21]=35;_bd[22]=160;_bd[23]=0xCC44AA;
-                    _bd[24]=-80;_bd[25]=180;_bd[26]=45;_bd[27]=45;_bd[28]=80;_bd[29]=0x66AAFF;
-                    _bd[30]=-20;_bd[31]=160;_bd[32]=25;_bd[33]=25;_bd[34]=250;_bd[35]=0xFFAA44;
-                    _bd[36]=40;_bd[37]=140;_bd[38]=40;_bd[39]=40;_bd[40]=110;_bd[41]=0x44FFAA;
-                    _bd[42]=100;_bd[43]=170;_bd[44]=30;_bd[45]=30;_bd[46]=140;_bd[47]=0xDD66BB;
-                    _bd[48]=-100;_bd[49]=280;_bd[50]=50;_bd[51]=50;_bd[52]=60;_bd[53]=0x4488CC;
-                    _bd[54]=30;_bd[55]=260;_bd[56]=35;_bd[57]=35;_bd[58]=180;_bd[59]=0xFF8844;
-                    _bd[60]=90;_bd[61]=300;_bd[62]=45;_bd[63]=45;_bd[64]=100;_bd[65]=0x44DDFF;
-                    _bd[66]=150;_bd[67]=250;_bd[68]=40;_bd[69]=40;_bd[70]=130;_bd[71]=0x8844CC;
-                    for (int _bi = 0; _bi < _nb; _bi++) {
-                        int _bi6 = _bi*6;
-                        int _bx = _bd[_bi6], _bz = _bd[_bi6+1], _bw = _bd[_bi6+2], _bdp = _bd[_bi6+3], _bh = _bd[_bi6+4];
-                        uint32_t _bc = _bd[_bi6+5];
-                        // 8 vertices of building box
-                        int _bv[8][3];
-                        _bv[0][0]=_bx-_bw/2;_bv[0][1]=0;_bv[0][2]=_bz-_bdp/2;
-                        _bv[1][0]=_bx+_bw/2;_bv[1][1]=0;_bv[1][2]=_bz-_bdp/2;
-                        _bv[2][0]=_bx+_bw/2;_bv[2][1]=_bh;_bv[2][2]=_bz-_bdp/2;
-                        _bv[3][0]=_bx-_bw/2;_bv[3][1]=_bh;_bv[3][2]=_bz-_bdp/2;
-                        _bv[4][0]=_bx-_bw/2;_bv[4][1]=0;_bv[4][2]=_bz+_bdp/2;
-                        _bv[5][0]=_bx+_bw/2;_bv[5][1]=0;_bv[5][2]=_bz+_bdp/2;
-                        _bv[6][0]=_bx+_bw/2;_bv[6][1]=_bh;_bv[6][2]=_bz+_bdp/2;
-                        _bv[7][0]=_bx-_bw/2;_bv[7][1]=_bh;_bv[7][2]=_bz+_bdp/2;
-                        int _bpx[8], _bpy[8];
-                        for (int _vi = 0; _vi < 8; _vi++) {
-                            int _x = _bv[_vi][0], _y = _bv[_vi][1], _z = _bv[_vi][2];
-                            int _x1 = (_x*_caa - _z*_sa)>>8;
-                            int _z1 = (_x*_sa + _z*_caa)>>8;
-                            int _d3 = 500, _s3 = _d3*256/(_z1+_d3);
-                            _bpx[_vi] = _cx0 + (_x1*_s3>>8);
-                            _bpy[_vi] = _cy0 + (100*_s3>>8)/2 - (_y*_s3>>8) + 100;
-                        }
-                        // Draw 4 vertical edges + 8 horizontal edges
-                        int _be[24] = {0,1,1,2,2,3,3,0,4,5,5,6,6,7,7,4,0,4,1,5,2,6,3,7};
-                        for (int _ei = 0; _ei < 12; _ei++) {
-                            int _a = _be[_ei*2], _b = _be[_ei*2+1];
-                            int _x1 = _bpx[_a], _y1 = _bpy[_a], _x2 = _bpx[_b], _y2 = _bpy[_b];
-                            // Skip if behind camera
-                            if (_x1 < _cfx-10 && _x2 < _cfx-10) continue;
-                            if (_x1 > _cfx+_cfw+10 && _x2 > _cfx+_cfw+10) continue;
-                            uint32_t _ec = _bc;
-                            if (_ei >= 8) _ec = ((_bc&0xFEFEFE)>>1)+0x222222; // top edges darker
-                            int _dx = _x2-_x1, _dy = _y2-_y1;
-                            int _adx = _dx<0?-_dx:_dx, _ady = _dy<0?-_dy:_dy;
-                            int _err = 0, _lx = _x1, _ly = _y1;
-                            if (_adx > _ady) {
-                                int _sy = _dy < 0 ? -1 : 1;
-                                _err = -_adx;
-                                for (int _li = 0; _li <= _adx; _li++) {
-                                    if (_lx >= _cfx && _lx < _cfx+_cfw && _ly >= _cfy && _ly < _cfy+_cfh) gfx_putpixel(_lx,_ly,_ec);
-                                    _err += _ady*2;
-                                    if (_err > 0) { _ly += _sy; _err -= _adx*2; }
-                                    _lx += (_dx<0 ? -1 : 1);
-                                }
-                            } else {
-                                int _sx = _dx < 0 ? -1 : 1;
-                                _err = -_ady;
-                                for (int _li = 0; _li <= _ady; _li++) {
-                                    if (_lx >= _cfx && _lx < _cfx+_cfw && _ly >= _cfy && _ly < _cfy+_cfh) gfx_putpixel(_lx,_ly,_ec);
-                                    _err += _adx*2;
-                                    if (_err > 0) { _lx += _sx; _err -= _ady*2; }
-                                    _ly += (_dy<0 ? -1 : 1);
-                                }
-                            }
-                        }
-                    }
-                    // Scanline overlay + watermark
-                    int _ct = _tick;
-                    for (int _y = _ct%6; _y < _cfh; _y += 6) {
-                        gfx_rect(_cfx, _cfy+_y, _cfw, 1, 0x00000033);
-                    }
-                    // Neon glow border
-                    for (int _gn = 0; _gn < 3; _gn++) {
-                        uint32_t _gc = _gn==0?0xFF00AA:_gn==1?0x00DDFF:0x44FF44;
-                        gfx_rect(_cfx,_cfy+_cfh-1-_gn,_cfw,1,_gc);
-                    }
-                    gfx_print_scaled(_cfx+_cfw/2-80, _cfy+_cfh/2-12, 0xFFFFFF66, "CITY CAM", 2);
-                    gfx_print(_cfx+8, _cfy+_cfh-20, 0xFF00AA88, "VITEZA CITY 3D");
+                    r3d_set_viewport(_cfx, _cfy, _cfw, _cfh);
+                    r3d_tick();
+                    r3d_draw(&r3d_cam);
+                    // Handle keyboard movement
+                    float _spd = 0.08f;
+                    float _rot = 0.04f;
+                    float _fwd = 0, _right = 0, _up = 0;
+                    if (k == 'w') _fwd = _spd;
+                    if (k == 's') _fwd = -_spd;
+                    if (k == 'a') _right = -_spd;
+                    if (k == 'd') _right = _spd;
+                    if (k == 'e') _up = _spd;
+                    if (k == 'q') _up = -_spd;
+                    if (k == KEY_LEFT) _rot = 0.05f;
+                    if (k == KEY_RIGHT) _rot = -0.05f;
+                    r3d_move_camera(&r3d_cam, _fwd, _right, _up);
+                    if (k == KEY_LEFT || k == KEY_RIGHT) r3d_rotate_camera(&r3d_cam, _rot, 0);
+                    if (k == KEY_UP) r3d_rotate_camera(&r3d_cam, 0, -0.04f);
+                    if (k == KEY_DOWN) r3d_rotate_camera(&r3d_cam, 0, 0.04f);
+                    // Info overlay
+                    gfx_print(_cfx+12, _cfy+10, 0xFFFFFF88, "REC ROOM — DormRoom");
+                    gfx_print(_cfx+12, _cfy+_cfh-36, 0xFFFFFF66, "WASD move | Arrows look | Q/E up/down");
                 }
 
                 gfx_print(wx+16, wy+wh-24, 0x3A4A6A, "[Esc] close");
@@ -3511,14 +4341,15 @@ _dock_go:
                 if (k == 27 || k == 'q') { ac97_stop_capture(); close_win(); search_focus = 1; goto redraw_desktop; }
                 int _mbw = 300, _mbh = 20, _mbx = w/2 - _mbw/2, _mby = h/2 - 40;
                 gfx_fill_round_rect(wx+16,wy+50,ww-32,wh-70,8,0x0E0E28);
-                gfx_print_scaled(wx+ww/2-60,wy+60,0x4488FF,"Mic Test",2);
+                gfx_print_scaled(wx+ww/2-60,wy+60,ACCENT,"Mic Test",2);
                 int _lev = ac97_capture_is_active() ? ac97_capture_level() : 0;
-                // Simulate level when no real capture (demo mode)
-                if (!ac97_capture_is_active()) {
+                // Animate a simulated meter when there is no real mic input (silence)
+                if (_lev < 300) {
                     _lev = ((_tick * 37 + (_tick/3)*19) % 30000);
                     if (_lev > 25000) _lev = 30000 - (_lev-25000);
                     if (_lev < 500) _lev = 500;
-                    gfx_print(wx+ww/2-80,_mby+50,0xFFAA44,"Demo mode (no capture)");
+                    gfx_print(wx+ww/2-80,_mby+50,0xFFAA44,
+                        ac97_capture_is_active() ? "No mic input - demo meter" : "Demo mode (no capture)");
                 }
                 int _pct = _lev * 100 / 32768;
                 if (_pct > 100) _pct = 100;
@@ -4074,6 +4905,63 @@ _dock_go:
                 continue;
             }
 
+            // ─── BootLoader Command Line (37) ───
+            if (win_type == 37) {
+                if (k == 27) { close_win(); goto redraw_desktop; }
+                if (k == KEY_UP && bl_scroll > 0) { bl_scroll--; bl_redraw(); continue; }
+                if (k == KEY_DOWN) { bl_scroll++; if (bl_scroll >= bl_count) bl_scroll = bl_count - 1; if (bl_scroll < 0) bl_scroll = 0; bl_redraw(); continue; }
+                if (k == '\b') { if (bl_pos > 0) { bl_pos--; bl_buf[bl_pos] = 0; } bl_redraw(); continue; }
+                if (k == '\n') {
+                    bl_buf[bl_pos] = 0;
+                    bl_add(bl_buf);
+                    char _cmd[128]; int _ci;
+                    for (_ci = 0; bl_lines[bl_count-1][_ci] && _ci < 127; _ci++) {
+                        char _ch = bl_lines[bl_count-1][_ci];
+                        if (_ch >= 'A' && _ch <= 'Z') _ch += 32;
+                        _cmd[_ci] = _ch;
+                    }
+                    _cmd[_ci] = 0;
+                    bl_pos = 0; bl_buf[0] = 0;
+                    if (_ci == 0) {
+                        bl_add(" ");
+                        bl_add("Type 'help' for info.");
+                    } else if (_ci == 4 && _cmd[0]=='h' && _cmd[1]=='e' && _cmd[2]=='l' && _cmd[3]=='p') {
+                        bl_add(" ");
+                        bl_add("/help");
+                        bl_add("Command Line:");
+                        bl_add("- Bloader open system --files");
+                        bl_add("This command opens file's of the os, allowing you to edit it, but you may need experience and percausions at the same time");
+                        bl_add("- Bloader erase os --kairoos");
+                        bl_add("It erases KairoOS, but not its files");
+                        bl_add("- BLoader repristinate os --Kairoos");
+                        bl_add("work only on KairoCode BLoader (an IDE that lets you create OS, no simulations), it saves the Bootloader as an app and repiristinates KairoOS like normal");
+                    } else if (bl_has(_cmd, "bloader") && bl_has(_cmd, "open") && bl_has(_cmd, "system") && bl_has(_cmd, "files")) {
+                        bl_add(" ");
+                        bl_add("- Bloader open system --files");
+                        bl_add("This command opens file's of the os, allowing you to edit it, but you may need experience and percausions at the same time");
+                    } else if (bl_has(_cmd, "bloader") && bl_has(_cmd, "erase") && bl_has(_cmd, "os") && bl_has(_cmd, "kairoos")) {
+                        bl_add(" ");
+                        bl_add("- Bloader erase os --kairoos");
+                        bl_add("It erases KairoOS, but not its files");
+                    } else if (bl_has(_cmd, "bloader") && bl_has(_cmd, "repristinate") && bl_has(_cmd, "os") && bl_has(_cmd, "kairoos")) {
+                        bl_add(" ");
+                        bl_add("- BLoader repristinate os --Kairoos");
+                        bl_add("work only on KairoCode BLoader (an IDE that lets you create OS, no simulations), it saves the Bootloader as an app and repiristinates KairoOS like normal");
+                    } else if (bl_has(_cmd, "bloader")) {
+                        bl_add(" ");
+                        bl_add("[Unknown BLoader command. Type 'help' for info]");
+                    } else {
+                        bl_add(" ");
+                        bl_add("[Unknown command. Type 'help' for info]");
+                    }
+                    bl_redraw();
+                    continue;
+                }
+                if (bl_pos < 126 && k >= ' ' && k <= '~') { bl_buf[bl_pos++] = k; bl_buf[bl_pos] = 0; bl_redraw(); continue; }
+                if (!k) { asm volatile("hlt"); continue; }
+                continue;
+            }
+
             if (!k) { asm volatile("hlt"); continue; }
             continue; // other windows: just wait for Esc
         }
@@ -4110,8 +4998,8 @@ _dock_go:
             search_focus = 0;
         }
 
-        // Keyboard cursor movement (arrow keys)
-        if (k == 0x01 || k == 0x02 || k == 0x03 || k == 0x04 || k == ' ') {
+        // Keyboard cursor movement (arrow keys) — disabled while search is focused
+        if ((k == 0x01 || k == 0x02 || k == 0x03 || k == 0x04 || k == ' ') && !search_focus) {
             mouse_move_by_key(k);
             goto redraw_desktop;
         }
@@ -4260,14 +5148,14 @@ _dock_go:
         }
 
         // Launchpad (L key)
-        if (k == 'l' && !win && (!search_focus || search_pos == 0)) {
+        if (k == 'l' && !win && !search_focus) {
             win=1;win_type=15;lp_sel_x=0;lp_sel_y=0;
             draw_launch_pad(w, h, lp_sel_x, lp_sel_y);
             continue;
         }
 
         // System Transfer (T key)
-        if (k == 't' && !win && (!search_focus || search_pos == 0)) {
+        if (k == 't' && !win && !search_focus) {
             st_mode = ST_MENU; st_sel = 0;
             win=1; win_type=27;
             draw_system_transfer(w, h, &(int){0});
@@ -4275,28 +5163,36 @@ _dock_go:
         }
 
         // Control Center (Ctrl+C)
-        if (is_ctrl_pressed() && k == 'c' && !win) {
+        if (k_ctrl && k == 'c' && !win) {
             nc_active=0; cc_active=!cc_active; cc_sel=0;
             if(!cc_active){goto redraw_desktop;}
             continue;
         }
 
         // Notification Center (Ctrl+N)
-        if (is_ctrl_pressed() && k == 'n' && !win) {
+        if (k_ctrl && k == 'n' && !win) {
             cc_active=0; nc_active=!nc_active; nc_sel=0;
             if(!nc_active){goto redraw_desktop;}
             continue;
         }
 
+        // Wi-Fi panel (Ctrl+X)
+        if (k_ctrl && k == 'x' && !win) {
+            cc_active=0; nc_active=0;
+            wifi_active=!wifi_active; wifi_sel=0;
+            if(wifi_active){wifi_request_scan();}
+            goto redraw_desktop;
+        }
+
         // Camera app (C key)
-        if (k == 'c' && !win && (!search_focus || search_pos == 0)) {
+        if (k == 'c' && !win && !search_focus) {
             open_app(11); draw_mac_title("Camera");
             gfx_print(wx+16, wy+44, 0x4A9EFF, "Camera — Hardware Status");
             continue;
         }
 
         // Kairo Player (V key)
-        if (k == 'v' && !win && (!search_focus || search_pos == 0)) {
+        if (k == 'v' && !win && !search_focus) {
             open_app(12); draw_mac_title("Kairo Player");
             // Video screen area
             gfx_fill_round_rect(wx+20, wy+48, ww-40, 130, 4, 0x000000);
@@ -4324,88 +5220,88 @@ _dock_go:
         }
 
         // True Video app (T key)
-        if (k == 't' && !win && (!search_focus || search_pos == 0)) {
-            open_app(14);
+        if (k == 't' && !win && !search_focus) {
+            open_app(14); draw_mac_title("True Video");
             continue;
         }
 
         // New App Shortcuts (single letters when no window)
-        if (k == 'e' && !win && (!search_focus || search_pos == 0)) { // Calendar
+        if (k == 'e' && !win && !search_focus) { // Calendar
             open_app(16); draw_mac_title("Calendar");
             // Will redraw on next tick
             continue;
         }
-        if (k == 'r' && !win && (!search_focus || search_pos == 0)) { // Pomodoro
+        if (k == 'r' && !win && !search_focus) { // Pomodoro
             open_app(17); draw_mac_title("Pomodoro Timer");
             pom_sec = pom_total; pom_running = 0; pom_ticks = 0;
             continue;
         }
-        if (k == 'w' && !win && (!search_focus || search_pos == 0)) { // Weather
+        if (k == 'w' && !win && !search_focus) { // Weather
             open_app(18); draw_mac_title("Weather"); wthr_first = 1;
             continue;
         }
-        if (k == 'i' && !win && (!search_focus || search_pos == 0)) { // Disk Usage
+        if (k == 'i' && !win && !search_focus) { // Disk Usage
             open_app(19); draw_mac_title("System Monitor");
             continue;
         }
-        if (k == 'a' && !win && (!search_focus || search_pos == 0)) { // ASCII Art
+        if (k == 'a' && !win && !search_focus) { // ASCII Art
             open_app(20); draw_mac_title("ASCII Art Gallery");
             art_sel = 0;
             continue;
         }
-        if (k == 'y' && !win && (!search_focus || search_pos == 0)) { // Typing Test
+        if (k == 'y' && !win && !search_focus) { // Typing Test
             open_app(21); draw_mac_title("Typing Test");
             type_pos = 0; type_err = 0; type_ok = 0; type_start = 0; type_done = 0;
             continue;
         }
-        if (k == 'o' && !win && (!search_focus || search_pos == 0)) { // Clipboard
+        if (k == 'o' && !win && !search_focus) { // Clipboard
             open_app(22); draw_mac_title("Clipboard");
             clip_save_pos = 0; clip_save[0] = 0;
             continue;
         }
-        if (k == 'f' && !win && (!search_focus || search_pos == 0)) { // File Manager
+        if (k == 'f' && !win && !search_focus) { // File Manager
             open_app(23); draw_mac_title("File Manager");
             fm_sel = 0; fm_scroll = 0;
             continue;
         }
-        if (k == 'g' && !win && (!search_focus || search_pos == 0)) { // Tetris
+        if (k == 'g' && !win && !search_focus) { // Tetris
             open_app(24); draw_mac_title("Tetris");
             continue;
         }
-        if (k == 'k' && !win && (!search_focus || search_pos == 0)) { // Kairo Games
+        if (k == 'k' && !win && !search_focus) { // Kairo Games
             open_app(25); draw_mac_title("Kairo Games");
             continue;
         }
-        if (k == 'z' && !win && (!search_focus || search_pos == 0)) { // Viteza Wii
+        if (k == 'z' && !win && !search_focus) { // Viteza Wii
             open_app(28); _wii_boot = 1;
             continue;
         }
-        if (k == 'p' && !win && (!search_focus || search_pos == 0)) { // Pong
+        if (k == 'p' && !win && !search_focus) { // Pong
             open_app(30); draw_mac_title("Pong ⚡");
             continue;
         }
-        if (k == 'b' && !win && (!search_focus || search_pos == 0)) { // Paint
+        if (k == 'b' && !win && !search_focus) { // Paint
             open_app(31); draw_mac_title("Paint 🎨");
             continue;
         }
-        if (k == 'x' && !win && (!search_focus || search_pos == 0)) { // Maze
+        if (k == 'x' && !win && !search_focus) { // Maze
             open_app(32); draw_mac_title("Maze 🗺️");
             continue;
         }
-        if (k == 'm' && !win && (!search_focus || search_pos == 0)) { // Mic Test
+        if (k == 'm' && !win && !search_focus) { // Mic Test
             ac97_start_capture();
-            open_app(29);
+            open_app(29); draw_mac_title("Mic Test");
             continue;
         }
-        if (k == 's' && !win && (!search_focus || search_pos == 0)) { // Music Player
+        if (k == 's' && !win && !search_focus) { // Music Player
             open_app(33); draw_mac_title("Music Player 🎵");
             continue;
         }
-        if (k == 'd' && !win && (!search_focus || search_pos == 0)) { // Dino Runner
+        if (k == 'd' && !win && !search_focus) { // Dino Runner
             open_app(34); draw_mac_title("Dino Runner 🦖");
             continue;
         }
-        if (k == 'h' && !win && (!search_focus || search_pos == 0)) { // Chat
+        if (k == 'h' && !win && !search_focus) { // Chat
             open_app(36); draw_mac_title("Kairo Chat 💬");
             continue;
         }
@@ -4417,7 +5313,7 @@ _dock_go:
         }
 
         // USB device simulation (press U) — works even when search is empty/focused
-        if (k == 'u' && !win && (!search_focus || search_pos == 0)) {
+        if (k == 'u' && !win && !search_focus) {
             play_click();
             usb_popup = 1;
             int px = w-220, py = h-108, pw = 200, ph = 40;
@@ -4579,7 +5475,7 @@ _dock_go:
                         gfx_print(wx+ww-130, wy+163, 0x3A5A8A, "Ready");
                         gfx_print(wx+24, wy+196, 0x8A9ACE, "[P] Play  [S] Stop  [Space] Sweep");
                         gfx_print(wx+20, wy+wh-18, 0x3A4A6A, "Powered by Kairo Visual & Kairo Audio");
-                    } else if (act == 14) { open_app(14); }
+                    } else if (act == 14) { open_app(14); draw_mac_title("True Video"); }
                     else if (act == 16) { open_app(16); draw_mac_title("Calendar"); }
                     else if (act == 17) { open_app(17); draw_mac_title("Pomodoro Timer"); pom_sec=pom_total; pom_running=0; pom_ticks=0; }
                     else if (act == 18) { open_app(18); draw_mac_title("Weather"); wthr_first=1; }

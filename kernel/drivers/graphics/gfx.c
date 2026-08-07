@@ -1,6 +1,9 @@
 #include "gfx.h"
+#include "../../../ui/renderer/renderer.h"
 
 static fb_info_t fb;
+
+volatile uint32_t *gfx_get_fb_addr(void) { return fb.framebuffer; }
 
 void gfx_init(fb_info_t *info)
 {
@@ -259,48 +262,16 @@ void gfx_blur_rect(int x, int y, int w, int h, int radius)
 
 void gfx_print(int x, int y, uint32_t color, const char *text)
 {
-    while (*text) {
-        unsigned char c = (unsigned char)*text++;
-        if (c >= FONT_AA_FIRST && c <= FONT_AA_LAST) {
-            int idx = c - FONT_AA_FIRST;
-            const uint8_t *glyph = font_aa_data[idx];
-            for (int r = 0; r < FONT_AA_H; r++) {
-                uint8_t byte = glyph[r];
-                for (int col = 0; col < FONT_AA_W; col++) {
-                    if (byte & (1 << (7 - col)))
-                        gfx_putpixel(x + col, y + r, color);
-                }
-            }
-            x += FONT_AA_W;
-        } else {
-            x += FONT_AA_W;
-        }
-    }
+    renderer_draw_text(x, y, text, color);
 }
 
 void gfx_print_shadow(int x, int y, uint32_t color, const char *text)
 {
-    gfx_print(x+1, y+1, 0x000008, text);
-    gfx_print(x, y, color, text);
+    renderer_draw_text(x + 1, y + 1, text, 0x000008);
+    renderer_draw_text(x, y, text, color);
 }
 
 void gfx_print_scaled(int x, int y, uint32_t color, const char *text, int scale)
 {
-    while (*text) {
-        unsigned char c = (unsigned char)*text++;
-        if (c >= FONT_AA_FIRST && c <= FONT_AA_LAST) {
-            int idx = c - FONT_AA_FIRST;
-            const uint8_t *glyph = font_aa_data[idx];
-            for (int r = 0; r < FONT_AA_H; r++) {
-                uint8_t byte = glyph[r];
-                for (int col = 0; col < FONT_AA_W; col++) {
-                    if (byte & (1 << (7 - col)))
-                        gfx_rect(x + col*scale, y + r*scale, scale, scale, color);
-                }
-            }
-            x += FONT_AA_W * scale;
-        } else {
-            x += FONT_AA_W * scale;
-        }
-    }
+    renderer_draw_text_scaled(x, y, text, color, scale);
 }

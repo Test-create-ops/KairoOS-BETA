@@ -9,7 +9,7 @@ extern void idt_flush(struct idt_ptr*);
 static struct idt_entry64 idt[IDT_ENTRIES];
 static struct idt_ptr idtp;
 
-static void idt_set_gate(uint8_t vector, uint64_t handler, uint8_t ist, uint8_t flags)
+void idt_set_gate(uint8_t vector, uint64_t handler, uint8_t ist, uint8_t flags)
 {
     idt[vector].isr_low  = handler & 0xFFFF;
     idt[vector].kernel_cs = 0x08; // kernel code segment
@@ -23,6 +23,8 @@ static void idt_set_gate(uint8_t vector, uint64_t handler, uint8_t ist, uint8_t 
 extern void isr_stub0(void);
 extern void irq_stub0(void);
 extern void irq1_keyboard_stub(void);
+extern void irq12_mouse_stub(void);
+extern void syscall_stub(void);
 
 void idt_init(void)
 {
@@ -42,6 +44,8 @@ void idt_init(void)
     idt_set_gate(0, (uint64_t)isr_stub0, 0, 0x8E);
     idt_set_gate(32, (uint64_t)irq_stub0, 0, 0x8E);
     idt_set_gate(33, (uint64_t)irq1_keyboard_stub, 0, 0x8E);
+    idt_set_gate(44, (uint64_t)irq12_mouse_stub, 0, 0x8E);
+    idt_set_gate(0x80, (uint64_t)syscall_stub, 0, 0xEE);
 
     isr_init();
     irq_init();

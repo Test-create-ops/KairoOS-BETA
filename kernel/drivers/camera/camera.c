@@ -117,17 +117,12 @@ int camera_get_product(void) {
 
 int camera_start_stream(void) {
     if (!cam.present) return 0;
-    /* Real implementation would:
-     * 1. Open USB video control interface
-     * 2. Send VS_PROBE_CONTROL to negotiate format
-     * 3. Send VS_COMMIT_CONTROL to commit streaming
-     * 4. Set up isochronous endpoint
-     * 5. Start receiving frames
-     *
-     * For now, report not implemented.
+    if (cam.streaming) return 1;
+    /* Streaming requires the UVC class protocol (VS_PROBE_CONTROL,
+     * VS_COMMIT_CONTROL, isochronous endpoint). Not implemented, so
+     * report failure instead of pretending to stream.
      */
-    cam.streaming = 1;
-    return 1;
+    return 0;
 }
 
 int camera_stop_stream(void) {

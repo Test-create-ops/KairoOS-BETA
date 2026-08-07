@@ -2,11 +2,13 @@ CC = x86_64-elf-gcc
 LD = x86_64-elf-ld
 AS = nasm
 
+USER_INIT = user/init
+
 CFLAGS = -m64 -ffreestanding -O2 -Wall -Wextra -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mno-sse -mno-sse2 -Wa,-noexecstack
 ASFLAGS = -f elf64
 LDFLAGS = -m elf_x86_64 -T build/linker.ld -nostdlib
 
-C_OBJS = kernel/kernel.o
+C_OBJS = kernel/kernel.o kernel/mmu/mmu.o kernel/drivers/graphics/render3d.o
 
 ASM_OBJS = kernel/asm/boot_entry.o \
            kernel/asm/gdt_flush.o \
@@ -14,14 +16,33 @@ ASM_OBJS = kernel/asm/boot_entry.o \
            kernel/asm/idt_flush.o \
            kernel/asm/context_switch.o \
            kernel/asm/usermode_trampoline.o \
-            kernel/asm/irq1_keyboard_stub.o
+kernel/asm/irq1_keyboard_stub.o \
+kernel/asm/irq12_mouse_stub.o \
+kernel/asm/syscall_stub.o \
+kernel/asm/context_save.o
+
+INITRD_OBJ = initrd_tar.o
 
 OBJS = $(C_OBJS) $(ASM_OBJS)
 
-all: kernel.bin
+all: initrd.tar kernel.bin
 
-kernel.bin: $(OBJS) build/linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+initrd_root/bin/init: $(USER_INIT)
+	mkdir -p initrd_root/bin
+	cp $(USER_INIT) initrd_root/bin/init
+
+$(USER_INIT): user/init.c user/linker.ld
+	$(CC) -m64 -ffreestanding -O2 -nostdlib -static -fno-pie -fno-stack-protector -mno-red-zone -fno-builtin -Wall -c user/init.c -o user/init.o
+	$(LD) -m elf_x86_64 -nostdlib -T user/linker.ld -o $@ user/init.o
+
+initrd.tar: initrd_root/bin/init
+	cd initrd_root && tar cf ../initrd.tar --exclude='._*' --exclude='PaxHeaders.*' . 2>/dev/null; if [ ! -f ../initrd.tar ] || [ ! -s ../initrd.tar ]; then touch ../initrd.tar; fi
+
+initrd_tar.o: initrd.tar
+	$(LD) -r -b binary -o $@ initrd.tar
+
+kernel.bin: $(OBJS) $(INITRD_OBJ) build/linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(INITRD_OBJ)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -30,4 +51,5 @@ kernel/asm/%.o: kernel/asm/%.asm
 	$(AS) $(ASFLAGS) $< -o $@
 
 clean:
-	rm -f $(OBJS) kernel.bin
+	rm -f $(OBJS) kernel.bin initrd_tar.o initrd.tar user/init user/init.o
+	rm -rf initrd_root

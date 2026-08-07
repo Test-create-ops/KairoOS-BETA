@@ -19,10 +19,10 @@ isr_stub0:
     push r9
     push r10
     push r11
-    push 0
-    mov rdi, [rsp]
+    ; rdi = puntatore al frame della CPU (dopo i 9 push, in fondo ci sono
+    ;       i registri salvati; il frame originale [EC?][RIP][CS][RFLAGS] e' sopra)
+    mov rdi, rsp
     call isr_handler
-    add rsp, 8
     pop r11
     pop r10
     pop r9

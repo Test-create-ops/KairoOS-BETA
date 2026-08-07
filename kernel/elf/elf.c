@@ -26,7 +26,7 @@ int elf_load_and_exec(const char *path)
 
     Elf64_Phdr *ph = (Elf64_Phdr *)((unsigned char *)file_buf + eh->e_phoff);
 
-    struct process *p = proc_create();
+    struct proc *p = proc_create();
     proc_setup_address_space(p);
 
     for (int i = 0; i < eh->e_phnum; i++) {

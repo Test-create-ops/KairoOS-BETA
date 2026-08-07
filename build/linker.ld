@@ -39,4 +39,6 @@ SECTIONS
         *(.bss*)
         *(COMMON)
     } :data
+
+    _end = .;
 }

@@ -1,1 +1,9 @@
 discord-publish.sh
+
+# macOS junk
+.DS_Store
+__pycache__/
+*.pyc
+stt_apple
+stt_apple.app/
+*.app/

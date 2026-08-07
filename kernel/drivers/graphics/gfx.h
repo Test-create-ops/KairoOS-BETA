@@ -27,6 +27,7 @@ void gfx_rect_alpha(int x, int y, int w, int h, uint32_t color, int alpha);
 void gfx_blur_rect(int x, int y, int w, int h, int radius);
 int gfx_width(void);
 int gfx_height(void);
+volatile uint32_t *gfx_get_fb_addr(void);
 
 #endif
 

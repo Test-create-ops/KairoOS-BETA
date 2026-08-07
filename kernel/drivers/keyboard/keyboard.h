@@ -6,6 +6,7 @@
 void keyboard_init(void);
 void keyboard_handler(void);
 char keyboard_last_char(void);
+int keyboard_last_ctrl(void);
 int is_alt_pressed(void);
 int is_ctrl_pressed(void);
 

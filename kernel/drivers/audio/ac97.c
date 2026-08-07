@@ -1,6 +1,8 @@
 #include "../pci/pci.c"
 #include "../../lib/framebuffer.h"
 #include "../../lib/io.h"
+#include "ac97_click.h"
+#include "ac97_confirm.h"
 
 // ─── AC97 registers ───
 
@@ -66,7 +68,7 @@ static int ac97_initialized = 0;
 // Aligned to 8-byte boundary for DMA
 static ac97_bd_t bd_list[32] __attribute__((aligned(8)));
 #define SAMPLE_RATE 44100
-#define SAMPLE_MS   500
+#define SAMPLE_MS   1500
 #define SAMPLE_COUNT (SAMPLE_RATE * SAMPLE_MS / 1000)
 // Stereo: 2 int16 per sample (left+right), so buffer is 2x sample count
 static int16_t sample_buf[SAMPLE_COUNT * 2] __attribute__((aligned(8)));
@@ -183,6 +185,54 @@ void ac97_play(uint32_t freq, uint32_t ms)
     outw(ac97_nabm + PO_CR, 0);
 }
 
+// ─── Keyboard click ───
+
+void ac97_play_click(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = CLICK_PCM_LEN;
+    if (nsamples > SAMPLE_COUNT * 2) nsamples = SAMPLE_COUNT * 2;
+    for (int i = 0; i < nsamples; i++)
+        sample_buf[i] = click_pcm[i];
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 2;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    int wait_us = (int)((unsigned long)CLICK_NUM_FRAMES * 1000000UL / SAMPLE_RATE);
+    for (volatile int w = 0; w < wait_us; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// ─── Confirm button sound (Wii-style) ───
+
+void ac97_play_confirm(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = CONFIRM_PCM_LEN;
+    if (nsamples > SAMPLE_COUNT * 2) nsamples = SAMPLE_COUNT * 2;
+    for (int i = 0; i < nsamples; i++)
+        sample_buf[i] = confirm_pcm[i];
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 2;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    int wait_us = (int)((unsigned long)CONFIRM_NUM_FRAMES * 1000000UL / SAMPLE_RATE);
+    for (volatile int w = 0; w < wait_us; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
 // ─── PC Speaker (legacy) — kept for compatibility ───
 
 static void speaker_off(void)
@@ -264,20 +314,40 @@ void speaker_beep(uint32_t freq, uint32_t ms)
 #define NOTE_D5  587
 #define NOTE_DS5 622
 #define NOTE_E5  659
+#define NOTE_F5  698
+#define NOTE_FS5 740
+#define NOTE_G5  784
+#define NOTE_GS5 831
+#define NOTE_A5  880
+#define NOTE_AS5 932
+#define NOTE_B5  988
+#define NOTE_C6  1047
+#define NOTE_CS6 1109
+#define NOTE_D6  1175
+#define NOTE_DS6 1245
+#define NOTE_E6  1319
+#define NOTE_F6  1397
+#define NOTE_FS6 1480
+#define NOTE_G6  1568
 
 void play_startup_melody(void)
 {
+    // Original "power-up" chime (no copyrighted melody)
     if (ac97_initialized) {
-        ac97_play(NOTE_C4, 100);
-        ac97_play(NOTE_E4, 100);
-        ac97_play(NOTE_G4, 100);
-        ac97_play(NOTE_C5, 200);
+        ac97_play(NOTE_G5, 90);
+        ac97_play(NOTE_C6, 90);
+        ac97_play(NOTE_E6, 90);
+        ac97_play(NOTE_G6, 260);
+        ac97_play(NOTE_C6, 120);
+        ac97_play(NOTE_G5, 180);
         return;
     }
-    speaker_beep(NOTE_C4, 100);
-    speaker_beep(NOTE_E4, 100);
-    speaker_beep(NOTE_G4, 100);
-    speaker_beep(NOTE_C5, 200);
+    speaker_beep(NOTE_G5, 90);
+    speaker_beep(NOTE_C6, 90);
+    speaker_beep(NOTE_E6, 90);
+    speaker_beep(NOTE_G6, 260);
+    speaker_beep(NOTE_C6, 120);
+    speaker_beep(NOTE_G5, 180);
     speaker_off();
 }
 
@@ -352,4 +422,68 @@ void ac97_stop_capture(void)
     if (!capture_active) return;
     outw(ac97_nabm + PI_CR, 0);
     capture_active = 0;
+}
+
+// ─── STT capture (ring 10s, riconoscimento in-kernel) ────────────────────
+
+#define STT_CAP_SECS  5
+#define STT_CAP_FRAMES (44100 * STT_CAP_SECS)
+#define STT_CAP_BYTES  (STT_CAP_FRAMES * 4)   // 4 byte per frame stereo
+
+static int16_t stt_cap_buf[STT_CAP_FRAMES * 2] __attribute__((aligned(16)));
+static ac97_bd_t stt_cap_bd[32] __attribute__((aligned(8)));
+static int stt_cap_active = 0;
+static int stt_cap_pos = 0;   // ultima posizione DMA osservata (bytes)
+
+void ac97_stt_start(void)
+{
+    if (!ac97_initialized) return;
+    outw(ac97_nabm + PI_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+    for (volatile int *p = (volatile int *)stt_cap_buf;
+         p < (volatile int *)(stt_cap_buf + STT_CAP_FRAMES * 2); p++) *p = 0;
+    stt_cap_bd[0].pointer = (uint32_t)(uintptr_t)stt_cap_buf;
+    stt_cap_bd[0].length = STT_CAP_BYTES;
+    stt_cap_bd[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PI_BDBAR, (uint32_t)(uintptr_t)stt_cap_bd);
+    outw(ac97_nabm + PI_LVI, 0);
+    for (volatile int d = 0; d < 1000; d++);
+    outw(ac97_mixer + MIX_REC_SELECT, 0x0000);   // fonte = microfono
+    outw(ac97_mixer + MIX_REC_GAIN, 0x0F0F);     // guadagno max
+    outw(ac97_mixer + 0x32, 44100);              // PCM ADC rate
+    outw(ac97_nabm + PI_CR, CR_RPBM);
+    stt_cap_active = 1;
+    stt_cap_pos = 0;
+}
+
+int ac97_stt_active(void) { return stt_cap_active; }
+
+// Da chiamare periodicamente; tiene traccia della posizione DMA massima.
+void ac97_stt_track(void)
+{
+    if (!stt_cap_active) return;
+    uint16_t picb = inw(ac97_nabm + PI_PICB);
+    long pos = STT_CAP_BYTES - picb;
+    if (pos < 0) pos = 0;
+    if (pos > STT_CAP_BYTES) pos = STT_CAP_BYTES;
+    if (pos > stt_cap_pos) stt_cap_pos = (int)pos;
+}
+
+int ac97_stt_valid_frames(void)
+{
+    ac97_stt_track();
+    if (stt_cap_pos <= 0) return 0;
+    int frames = stt_cap_pos / 4;
+    if (frames > STT_CAP_FRAMES) frames = STT_CAP_FRAMES;
+    return frames;
+}
+
+const int16_t *ac97_stt_buffer(void) { return stt_cap_buf; }
+
+void ac97_stt_stop(void)
+{
+    if (!stt_cap_active) return;
+    ac97_stt_track();
+    outw(ac97_nabm + PI_CR, 0);
+    stt_cap_active = 0;
 }

@@ -15,6 +15,7 @@ static uint8_t mouse_packet[3];
 static int mouse_btn_prev = 0;
 static int ps2_active = 0;
 static int ps2_tried = 0;
+static int mouse_irq_delivered = 0;
 
 static int cursor_drawn = 0;
 static int last_cx = 0, last_cy = 0;
@@ -35,6 +36,24 @@ static const uint16_t cursor_shape[CURSOR_H] = {
     0b100001000,
     0b100010000,
 };
+
+static const uint16_t snowflake_shape[CURSOR_H] = {
+    0b000010000,
+    0b000010000,
+    0b100010001,
+    0b010010010,
+    0b001010100,
+    0b000111000,
+    0b111111111,
+    0b000111000,
+    0b001010100,
+    0b010010010,
+    0b100010001,
+    0b000010000,
+    0b000010000,
+};
+
+int christmas_cursor = 0;
 
 void mouse_init(void)
 {
@@ -115,13 +134,13 @@ void mouse_poll(void)
     // Lazy PS/2 init
     if (!ps2_tried) ps2_try_init();
 
-    // If PS/2 is active, poll it
-    if (ps2_active) {
+    // Fallback poll: if IRQ12 has not delivered packets recently, drain the FIFO
+    if (ps2_active && !mouse_irq_delivered) {
         while (1) {
             uint8_t s = inb(PS2_STATUS);
             if (!(s & 1)) break;
             if (!(s & 0x20)) {  // not mouse data, leave it for keyboard
-                uint8_t kdata = inb(PS2_DATA);
+                (void)inb(PS2_DATA);
                 break;
             }
             uint8_t data = inb(PS2_DATA);
@@ -139,6 +158,27 @@ void mouse_poll(void)
                 process_packet();
             }
         }
+    }
+}
+
+// IRQ12 handler: called from irq12_mouse_stub.asm when the PS/2 mouse
+// delivers a data byte through the interrupt line.
+void mouse_handler(void)
+{
+    uint8_t data = inb(PS2_DATA);
+    mouse_irq_delivered = 1;
+
+    if (mouse_packet_byte == 0) {
+        if (!(data & 0x08)) return;  // not a packet start byte
+        mouse_packet[0] = data;
+        mouse_packet_byte = 1;
+    } else if (mouse_packet_byte == 1) {
+        mouse_packet[1] = data;
+        mouse_packet_byte = 2;
+    } else {
+        mouse_packet[2] = data;
+        mouse_packet_byte = 0;
+        process_packet();
     }
 }
 
@@ -181,12 +221,13 @@ void draw_cursor(void)
     }
 
     // Draw cursor at new position
+    const uint16_t *shape = christmas_cursor ? snowflake_shape : cursor_shape;
     for (int i = 0; i < CURSOR_H; i++) {
         for (int j = 0; j < CURSOR_W; j++) {
-            if (cursor_shape[i] & (1 << (8-j))) {
+            if (shape[i] & (1 << (8-j))) {
                 int x = mouse_x + j, y = mouse_y + i;
                 if (x >= 0 && x < gfx_width() && y >= 0 && y < gfx_height())
-                    gfx_putpixel(x, y, 0xFFFFFF);
+                    gfx_putpixel(x, y, christmas_cursor ? 0xDDEEFF : 0xFFFFFF);
             }
         }
     }

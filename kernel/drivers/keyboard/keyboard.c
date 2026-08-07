@@ -15,6 +15,7 @@ static const char scancode_set1[128] = {
 };
 
 static volatile char last_char = 0;
+static volatile int last_char_ctrl = 0;
 static int e0_prefix = 0;
 static int alt_pressed = 0;
 static int ctrl_pressed = 0;
@@ -32,6 +33,13 @@ char keyboard_last_char(void)
 {
     char c = last_char;
     last_char = 0;
+    return c;
+}
+
+int keyboard_last_ctrl(void)
+{
+    int c = last_char_ctrl;
+    last_char_ctrl = 0;
     return c;
 }
 
@@ -71,6 +79,7 @@ void keyboard_handler(void)
     char c = scancode_set1[sc];
     if (c) {
         last_char = c;
+        last_char_ctrl = ctrl_pressed;
     }
 }
 

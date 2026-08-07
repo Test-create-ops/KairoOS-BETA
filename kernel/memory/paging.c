@@ -26,13 +26,19 @@ void paging_init(uint32_t fb_addr)
     for (int i = 0; i < PT_ENTRIES;   i++) pt[i]   = 0;
 
     uint64_t flags = PAGE_PRESENT | PAGE_RW;
+    uint64_t huge = PAGE_PRESENT | PAGE_RW | PAGE_PS;
 
-    for (uint64_t addr = 0; addr < 0x200000; addr += PAGE_SIZE) {
-        map_page(addr, addr, flags);
+    pml4[0] = (uint64_t)&pdpt[0] | flags;
+    pdpt[0] = (uint64_t)&pd[0] | flags;
+
+    // Identity map first 16MB using 2MB huge pages
+    for (uint64_t addr = 0; addr < 0x1000000; addr += 0x200000) {
+        uint64_t idx = (addr >> 21) & 0x1FF;
+        pd[idx] = addr | huge;
     }
 
     // Map detected framebuffer as 2MB huge pages (16MB total)
-    uint64_t fb_flags = PAGE_PRESENT | PAGE_RW | 0x80;
+    uint64_t fb_flags = PAGE_PRESENT | PAGE_RW | PAGE_PS;
     uint64_t base = (uint64_t)fb_addr;
     for (uint64_t off = 0; off < 0x1000000; off += 0x200000) {
         uint64_t addr = base + off;
@@ -51,10 +57,10 @@ void paging_enable(void)
     uint64_t cr0, cr4;
 
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-    cr4 |= (1 << 5); // PAE
+    cr4 |= (1UL << 5); // PAE
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
 
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 |= (1 << 31); // paging enable
+    cr0 |= (1UL << 31); // paging enable
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
 }

@@ -1,3 +1,4 @@
+#include "boot_logo.h"
 static int BS_W, BS_H;
 
 static void bs_rect(int x, int y, int w, int h, unsigned c) { gfx_rect(x, y, w, h, c); }
@@ -71,7 +72,7 @@ void boot_screen(int scr_w, int scr_h) {
     gfx_print((scr_w - 82) / 2, cy + 94, 0x556688, "Version 1.0");
 
     // Progress bar
-    int bx = (scr_w - 300) / 2, by = cy + 125, bw = 300, bh = 3;
+    int bx = (scr_w - 300) / 2, by = cy + 140, bw = 300, bh = 3;
     bs_round(bx, by, bw, bh, 1, 0x1A2A4A);
 
     const char *msgs[] = { "Initializing", "Loading kernel", "Starting services", "Almost ready" };
@@ -158,6 +159,18 @@ void boot_screen(int scr_w, int scr_h) {
                 int r = 1 + t/30, g = 2 + t/40, b = 6 + t/20;
                 if (r > 8) r = 8; if (g > 12) g = 12; if (b > 30) b = 30;
                 gfx_rect(x-4, yy, 8, 1, (r<<16)|(g<<8)|b);
+            }
+        }
+    }
+
+    // "Powered by" logo — bottom of screen
+    {
+        int lx = (scr_w - LOGO_W) / 2, ly = scr_h - LOGO_H - 20;
+        gfx_print((scr_w - 90) / 2, ly - 14, 0x445566, "Powered by");
+        for (int yy = 0; yy < LOGO_H; yy++) {
+            for (int xx = 0; xx < LOGO_W; xx++) {
+                uint32_t c = logo_data[yy * LOGO_W + xx];
+                if (c) gfx_putpixel(lx + xx, ly + yy, c);
             }
         }
     }
