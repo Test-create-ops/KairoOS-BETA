@@ -27,6 +27,13 @@
 #define CHK_FULL     1003
 #define STAT_STATUS  1004
 #define BTN_ABOUT    1005
+#define RB_MEM_256   1006
+#define RB_MEM_512   1007
+#define RB_MEM_1024  1008
+#define RB_MEM_2048  1009
+
+static const int mem_choices[] = { 256, 512, 1024, 2048 };
+#define MEM_DEFAULT  mem_choices[1]
 
 static HWND g_hWnd, g_hBtnStart, g_hBtnStop, g_hChk, g_hStatus;
 static HANDLE g_hProc = NULL;
@@ -95,14 +102,21 @@ static void start_windiroos(void)
         return;
     }
 
+    int mb = MEM_DEFAULT;
+    if (IsDlgButtonChecked(g_hWnd, RB_MEM_256))  mb = mem_choices[0];
+    else if (IsDlgButtonChecked(g_hWnd, RB_MEM_512))  mb = mem_choices[1];
+    else if (IsDlgButtonChecked(g_hWnd, RB_MEM_1024)) mb = mem_choices[2];
+    else if (IsDlgButtonChecked(g_hWnd, RB_MEM_2048)) mb = mem_choices[3];
+
     char cmd[2048];
     _snprintf(cmd, sizeof cmd,
         "\"%s\" "
-        "-machine pc,accel=tcg -cpu qemu64 -m 1024 -vga std -soundhw ac97 "
+        "-machine pc,accel=tcg -cpu qemu64 -m %d -vga std "
+        "-audiodev dsound,id=audio0 -machine pcspk-audiodev=audio0 -device AC97,audiodev=audio0 "
         "-drive if=pflash,format=raw,readonly=on,file=\"%s\" "
         "-cdrom \"%s\" -boot d "
         "-display gtk,window-close=on",
-        qemu, ovmf, iso);
+        qemu, mb, ovmf, iso);
 
     if (SendMessageA(g_hChk, BM_GETCHECK, 0, 0) == BST_CHECKED) {
         char *p = strchr(cmd, ' ');
@@ -158,21 +172,40 @@ static void create_controls(void)
 {
     HINSTANCE hi = GetModuleHandle(NULL);
 
+    CreateWindowExA(0, "STATIC", "Memoria (MB):",
+        WS_CHILD | WS_VISIBLE, 36, 168, 82, 20, g_hWnd, NULL, hi, NULL);
+    CreateWindowExA(0, "BUTTON", "256",
+        WS_CHILD | WS_VISIBLE | WS_GROUP | BS_AUTORADIOBUTTON, 122, 166, 46, 20, g_hWnd, (HMENU)RB_MEM_256, hi, NULL);
+    CreateWindowExA(0, "BUTTON", "512",
+        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 168, 166, 46, 20, g_hWnd, (HMENU)RB_MEM_512, hi, NULL);
+    CreateWindowExA(0, "BUTTON", "1024",
+        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 214, 166, 50, 20, g_hWnd, (HMENU)RB_MEM_1024, hi, NULL);
+    CreateWindowExA(0, "BUTTON", "2048",
+        WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 264, 166, 52, 20, g_hWnd, (HMENU)RB_MEM_2048, hi, NULL);
+    SendMessageA(GetDlgItem(g_hWnd, RB_MEM_512), BM_SETCHECK, BST_CHECKED, 0);
+    {
+        int ids[] = { RB_MEM_256, RB_MEM_512, RB_MEM_1024, RB_MEM_2048 };
+        int i;
+        for (i = 0; i < 4; i++)
+            SendMessageA(GetDlgItem(g_hWnd, ids[i]), WM_SETFONT,
+                (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    }
+
     g_hChk = CreateWindowExA(0, "BUTTON", "A schermo intero",
-        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 300, 220, 26, g_hWnd, (HMENU)CHK_FULL, hi, NULL);
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 302, 220, 26, g_hWnd, (HMENU)CHK_FULL, hi, NULL);
     SendMessageA(g_hChk, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 
     g_hBtnStart = CreateWindowExA(0, "BUTTON", "Avvia WindiroOS",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 36, 196, 240, 42, g_hWnd, (HMENU)BTN_START, hi, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 36, 200, 240, 42, g_hWnd, (HMENU)BTN_START, hi, NULL);
     SendMessageA(g_hBtnStart, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 
     g_hBtnStop = CreateWindowExA(0, "BUTTON", "Stop",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 292, 196, 90, 42, g_hWnd, (HMENU)BTN_STOP, hi, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 288, 200, 96, 42, g_hWnd, (HMENU)BTN_STOP, hi, NULL);
     EnableWindow(g_hBtnStop, FALSE);
     SendMessageA(g_hBtnStop, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 
     g_hStatus = CreateWindowExA(0, "STATIC", g_status,
-        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 36, 270, 360, 24, g_hWnd, (HMENU)STAT_STATUS, hi, NULL);
+        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, 36, 272, 340, 24, g_hWnd, (HMENU)STAT_STATUS, hi, NULL);
     SendMessageA(g_hStatus, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 }
 
@@ -264,7 +297,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPSTR cmd, int show)
     wc.lpszClassName = "WindiroOSLauncherWnd";
     RegisterClassA(&wc);
 
-    RECT r = {0, 0, 370, 350};
+    RECT r = {0, 0, 400, 360};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
 
     g_hWnd = CreateWindowExA(0, "WindiroOSLauncherWnd", "WindiroOS",

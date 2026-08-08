@@ -26,11 +26,11 @@ brew install mingw-w64 p7zip makensis
 
 ```bash
 make iso                      # genera viteza.iso (se non già fatto)
-cd tools/winapp
+cd tools/windiroos
 PACK_SAMPLE=/percorso/PackSample ./build-winapp.sh
 ```
 
-Risultati in `tools/winapp/out/`:
+Risultati in `tools/windiroos/out/`:
 - `WindiroOS-Setup.exe` — installer per GitHub
 - `WindiroOS-x86_64.msix` — pacchetto per lo Store
 - `payload/` — cartella finale (launcher + qemu + viteza.iso)
@@ -49,7 +49,7 @@ Opzioni: `--local-qemu DIR` (usa binari già scaricati), `--skip-msix`, `--skip-
    **"WindiroOS"** (valido 3 mesi).
 3. Nell'overview del prodotto: **Product management → View app identity details**.
    Ti darà i valori esatti (Publisher, ecc.).
-4. Sostituisci i placeholder in `tools/winapp/AppxManifest.xml`:
+4. Sostituisci i placeholder in `tools/windiroos/AppxManifest.xml`:
 
    ```xml
    <Identity Name="WindiroOS"

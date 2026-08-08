@@ -3,7 +3,7 @@
 # WindiroOS — build della Windows app (.exe + .msix per lo Store)
 # Esegui da macOS (toolchain mingw-w64).
 #
-# Produce in tools/winapp/out/:
+# Produce in tools/windiroos/out/:
 #   - WindiroOS-win/           cartella pronta (qemu + iso + windiroos.exe)
 #   - WindiroOS-x86_64.msix    pacchetto per il Microsoft Store
 #   - WindiroOS-Setup.exe      installer Windows (NSIS) per GitHub
@@ -107,18 +107,22 @@ if [[ $SKIP_MSIX -eq 1 ]]; then
 else
     PACK_SAMPLE="${PACK_SAMPLE:-}"
     if [[ -z "$PACK_SAMPLE" ]]; then
-        PACK_SAMPLE="$(find "$OUT" "$HOME" -maxdepth 6 -name PackSample -type f 2>/dev/null | head -1 || true)"
+        PACK_SAMPLE="$(find "$OUT" "$HOME" /tmp/msix-packaging -maxdepth 6 \( -name makemsix -o -name PackSample \) -type f 2>/dev/null | head -1 || true)"
     fi
     if [[ -z "$PACK_SAMPLE" ]]; then
-        echo "   (PackSample non trovato: salto il pacchetto MSIX)"
+        echo "   (Tool MSIX non trovato: salto il pacchetto MSIX)"
         echo "   Compila l'SDK Microsoft msix-packaging ed esporta:"
-        echo "   export PACK_SAMPLE=/percorso/PackSample"
+        echo "   export PACK_SAMPLE=/percorso/makemsix"
     else
-        echo "   copio il manifest (modifica REPLACE_ME con la tua identità Partner Center)"
+        echo "   copio il manifest..."
         cp "$HERE/AppxManifest.xml" "$PAYLOAD/AppxManifest.xml"
         cp -r "$HERE/assets" "$PAYLOAD/assets"
-        echo "   PackSample -d $PAYLOAD ..."
-        (cd "$OUT" && DYLD_LIBRARY_PATH="$(dirname "$PACK_SAMPLE")" "$PACK_SAMPLE" -d "$PAYLOAD" -p "$OUT/WindiroOS-x86_64.msix")
+        echo "   Pacchettizzo con $PACK_SAMPLE ..."
+        if [[ "$(basename "$PACK_SAMPLE")" == "makemsix" ]]; then
+            (cd "$OUT" && DYLD_LIBRARY_PATH="$(dirname "$PACK_SAMPLE")/../lib" "$PACK_SAMPLE" pack -d "$PAYLOAD" -p "$OUT/WindiroOS-x86_64.msix")
+        else
+            (cd "$OUT" && DYLD_LIBRARY_PATH="$(dirname "$PACK_SAMPLE")" "$PACK_SAMPLE" -d "$PAYLOAD" -p "$OUT/WindiroOS-x86_64.msix")
+        fi
         ls -lh "$OUT/WindiroOS-x86_64.msix"
     fi
 fi
