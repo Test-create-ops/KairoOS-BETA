@@ -4,6 +4,7 @@
 static fb_info_t fb;
 
 volatile uint32_t *gfx_get_fb_addr(void) { return fb.framebuffer; }
+uint32_t gfx_get_pitch(void) { return fb.pitch; }
 
 void gfx_init(fb_info_t *info)
 {
@@ -93,6 +94,125 @@ void gfx_fill_round_rect(int x, int y, int w, int h, int r, uint32_t color)
         gfx_rect(x + w - 1 - r, y + r - dy, dx+1, 1, color);
         gfx_rect(x + r - dx, y + h - 1 - r + dy, dx+1, 1, color);
         gfx_rect(x + w - 1 - r, y + h - 1 - r + dy, dx+1, 1, color);
+    }
+}
+
+// ─── Anti-aliased rounded rectangle (subpixel coverage) ────────────────
+
+#define AA_SS 6
+
+static int aa_round_inside(int dx, int dy, int w, int h, int r, int sx, int sy)
+{
+    int px = dx * AA_SS + sx + 1;
+    int py = dy * AA_SS + sy + 1;
+    int ex = w * AA_SS - 1 - px;
+    int by = h * AA_SS - 1 - py;
+    int R = r * AA_SS;
+    if (px < R && py < R) { int cxx = px - R, cyy = py - R; if (cxx*cxx + cyy*cyy > R*R) return 0; }
+    if (ex < R && py < R) { int cxx = ex - R, cyy = py - R; if (cxx*cxx + cyy*cyy > R*R) return 0; }
+    if (px < R && by < R) { int cxx = px - R, cyy = by - R; if (cxx*cxx + cyy*cyy > R*R) return 0; }
+    if (ex < R && by < R) { int cxx = ex - R, cyy = by - R; if (cxx*cxx + cyy*cyy > R*R) return 0; }
+    return 1;
+}
+
+void gfx_fill_round_rect_aa(int x, int y, int w, int h, int r, uint32_t color)
+{
+    if (r > w/2) r = w/2;
+    if (r > h/2) r = h/2;
+    if (r <= 0) { gfx_rect(x, y, w, h, color); return; }
+    int N = AA_SS * AA_SS;
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= (int)fb.height) continue;
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= (int)fb.width) continue;
+            int dx = xx - x, dy = yy - y;
+            int ex = (x + w - 1) - xx, by = (y + h - 1) - yy;
+            if (dy >= r && by >= r && dx >= r && ex >= r) { gfx_putpixel(xx, yy, color); continue; }
+            int cov = 0;
+            for (int sy = 0; sy < AA_SS; sy++)
+                for (int sx = 0; sx < AA_SS; sx++)
+                    if (aa_round_inside(dx, dy, w, h, r, sx, sy)) cov++;
+            if (cov == N) gfx_putpixel(xx, yy, color);
+            else if (cov > 0) {
+                int num = cov;
+                uint32_t bg = gfx_getpixel(xx, yy);
+                int ar = (color >> 16) & 0xFF, ag = (color >> 8) & 0xFF, ab = color & 0xFF;
+                int br = (bg >> 16) & 0xFF, bgn = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+                int dr = (ar * num + br * (N - num)) / N;
+                int dg = (ag * num + bgn * (N - num)) / N;
+                int db = (ab * num + bb * (N - num)) / N;
+                gfx_putpixel(xx, yy, (dr << 16) | (dg << 8) | db);
+            }
+        }
+    }
+}
+
+// ─── Anti-aliased filled circle ────────────────────────────────────────
+
+void gfx_fill_circle_aa(int cx, int cy, int r, uint32_t color)
+{
+    if (r <= 0) return;
+    int N = AA_SS * AA_SS;
+    int R2 = r * r * AA_SS * AA_SS;
+    for (int yy = cy - r - 1; yy <= cy + r + 1; yy++) {
+        if (yy < 0 || yy >= (int)fb.height) continue;
+        for (int xx = cx - r - 1; xx <= cx + r + 1; xx++) {
+            if (xx < 0 || xx >= (int)fb.width) continue;
+            int cov = 0;
+            for (int sy = 0; sy < AA_SS; sy++)
+                for (int sx = 0; sx < AA_SS; sx++) {
+                    int px = (xx - cx) * AA_SS + sx + 1;
+                    int py = (yy - cy) * AA_SS + sy + 1;
+                    if (px * px + py * py <= R2) cov++;
+                }
+            if (cov == N) gfx_putpixel(xx, yy, color);
+            else if (cov > 0) {
+                int num = cov;
+                uint32_t bg = gfx_getpixel(xx, yy);
+                int ar = (color >> 16) & 0xFF, ag = (color >> 8) & 0xFF, ab = color & 0xFF;
+                int br = (bg >> 16) & 0xFF, bgn = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+                int dr = (ar * num + br * (N - num)) / N;
+                int dg = (ag * num + bgn * (N - num)) / N;
+                int db = (ab * num + bb * (N - num)) / N;
+                gfx_putpixel(xx, yy, (dr << 16) | (dg << 8) | db);
+            }
+        }
+    }
+}
+
+// ─── Anti-aliased ring (annulus) ───────────────────────────────────────
+
+void gfx_circle_aa(int cx, int cy, int r, int thick, uint32_t color)
+{
+    if (r <= 0) return;
+    int N = AA_SS * AA_SS;
+    int ro = r, ri = r - thick;
+    if (ri < 1) ri = 1;
+    int Ro2 = ro * ro * AA_SS * AA_SS, Ri2 = ri * ri * AA_SS * AA_SS;
+    for (int yy = cy - ro - 1; yy <= cy + ro + 1; yy++) {
+        if (yy < 0 || yy >= (int)fb.height) continue;
+        for (int xx = cx - ro - 1; xx <= cx + ro + 1; xx++) {
+            if (xx < 0 || xx >= (int)fb.width) continue;
+            int cov = 0;
+            for (int sy = 0; sy < AA_SS; sy++)
+                for (int sx = 0; sx < AA_SS; sx++) {
+                    int px = (xx - cx) * AA_SS + sx + 1;
+                    int py = (yy - cy) * AA_SS + sy + 1;
+                    int d2 = px * px + py * py;
+                    if (d2 <= Ro2 && d2 >= Ri2) cov++;
+                }
+            if (cov == N) gfx_putpixel(xx, yy, color);
+            else if (cov > 0) {
+                int num = cov;
+                uint32_t bg = gfx_getpixel(xx, yy);
+                int ar = (color >> 16) & 0xFF, ag = (color >> 8) & 0xFF, ab = color & 0xFF;
+                int br = (bg >> 16) & 0xFF, bgn = (bg >> 8) & 0xFF, bb = bg & 0xFF;
+                int dr = (ar * num + br * (N - num)) / N;
+                int dg = (ag * num + bgn * (N - num)) / N;
+                int db = (ab * num + bb * (N - num)) / N;
+                gfx_putpixel(xx, yy, (dr << 16) | (dg << 8) | db);
+            }
+        }
     }
 }
 
@@ -274,4 +394,56 @@ void gfx_print_shadow(int x, int y, uint32_t color, const char *text)
 void gfx_print_scaled(int x, int y, uint32_t color, const char *text, int scale)
 {
     renderer_draw_text_scaled(x, y, text, color, scale);
+}
+
+void gfx_line(int x0, int y0, int x1, int y1, int thick, uint32_t color)
+{
+    int dx = x1 - x0, dy = y1 - y0;
+    int steps = dx < 0 ? -dx : dx;
+    if (dy < 0 ? -dy : dy > steps) steps = dy < 0 ? -dy : dy;
+    if (steps == 0) {
+        for (int i = -(thick/2); i <= thick/2; i++)
+            for (int j = -(thick/2); j <= thick/2; j++)
+                gfx_putpixel(x0+i, y0+j, color);
+        return;
+    }
+    for (int s = 0; s <= steps; s++) {
+        int px = x0 + dx * s / steps;
+        int py = y0 + dy * s / steps;
+        for (int i = -(thick/2); i <= thick/2; i++)
+            for (int j = -(thick/2); j <= thick/2; j++)
+                gfx_putpixel(px+i, py+j, color);
+    }
+}
+
+void gfx_blit_alpha(int x, int y, int w, int h, const unsigned char *alpha, uint32_t color)
+{
+    volatile uint32_t *fb = gfx_get_fb_addr();
+    uint32_t pitch = gfx_get_pitch() / 4;
+    uint32_t sw = gfx_width(), sh = gfx_height();
+    int cr = (color >> 16) & 0xFF;
+    int cg = (color >> 8) & 0xFF;
+    int cb = color & 0xFF;
+    for (int row = 0; row < h; row++) {
+        int fy = y + row;
+        if (fy < 0 || fy >= (int)sh) continue;
+        for (int col = 0; col < w; col++) {
+            int fx = x + col;
+            if (fx < 0 || fx >= (int)sw) continue;
+            unsigned char a = alpha[row * w + col];
+            if (a == 0) continue;
+            if (a == 255) {
+                fb[fy * pitch + fx] = color;
+            } else {
+                uint32_t dst = fb[fy * pitch + fx];
+                int dr = (dst >> 16) & 0xFF;
+                int dg = (dst >> 8) & 0xFF;
+                int db = dst & 0xFF;
+                int r = dr + ((cr - dr) * a >> 8);
+                int g = dg + ((cg - dg) * a >> 8);
+                int b = db + ((cb - db) * a >> 8);
+                fb[fy * pitch + fx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
 }

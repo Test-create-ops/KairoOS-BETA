@@ -187,7 +187,7 @@ init_page_tables:
 
     mov edi, pd
     mov eax, 0x000083
-    mov ecx, 4
+    mov ecx, 16
 .1:
     mov dword [edi], eax
     mov dword [edi + 4], 0
@@ -198,9 +198,9 @@ init_page_tables:
 
     serial 'P'
 
-    ; Enable PAE
+    ; Enable PAE + SSE + OSXMMEXCPT
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, 1 << 5 | 1 << 9 | 1 << 10
     mov cr4, eax
 
     ; Enable long mode

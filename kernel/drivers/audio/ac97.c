@@ -4,6 +4,28 @@
 #include "ac97_click.h"
 #include "ac97_confirm.h"
 
+// TEMP DEBUG (serial COM1, will be removed)
+#define DPRINT(s) do { const char *_p = (s); while (*_p) { outb(0x3F8, *_p++); } } while (0)
+static void dprint_init(void) {
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x80);
+    outb(0x3F8 + 0, 0x01);
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x03);
+    outb(0x3F8 + 2, 0xC7);
+}
+static void dprint_hex(unsigned int v) {
+    const char *h = "0123456789ABCDEF";
+    outb(0x3F8, '0'); outb(0x3F8, 'x');
+    for (int i = 7; i >= 0; i--) outb(0x3F8, h[(v >> (i * 4)) & 0xF]);
+}
+static void dprint_dec(int v) {
+    char t[16]; int n = 0;
+    if (v == 0) { outb(0x3F8, '0'); return; }
+    while (v > 0 && n < 15) { t[n++] = '0' + (v % 10); v /= 10; }
+    while (n > 0) outb(0x3F8, t[--n]);
+}
+
 // ─── AC97 registers ───
 
 // NABM (Native Audio Bus Master) - BAR0
@@ -80,10 +102,15 @@ void ac97_init(void)
     ac97_nabm = 0;
     ac97_mixer = 0;
 
+    dprint_init();
+    DPRINT("\r\n[ac97] init pci_count="); dprint_dec(pci_count); DPRINT("\r\n");
+
     for (int i = 0; i < pci_count; i++) {
         unsigned int class = pci_read32(pci_list[i].bus, pci_list[i].slot, 0, 8);
         unsigned char base = (class >> 24) & 0xFF;
         unsigned char sub  = (class >> 16) & 0xFF;
+
+        DPRINT("[ac97] dev "); dprint_dec(i); DPRINT(" base=0x"); dprint_hex(base); DPRINT(" sub=0x"); dprint_hex(sub); DPRINT("\r\n");
 
         if (base == 0x04 && sub == 0x01) {
             unsigned int bar0 = pci_read32(pci_list[i].bus, pci_list[i].slot, 0, 0x10);
@@ -96,11 +123,13 @@ void ac97_init(void)
             cmd |= 0x05;
             pci_write32(pci_list[i].bus, pci_list[i].slot, 0, 0x04, cmd);
 
+            DPRINT("[ac97] FOUND bar0=0x"); dprint_hex(bar0); DPRINT(" bar1=0x"); dprint_hex(bar1); DPRINT("\r\n");
             break;
         }
     }
 
     if (!ac97_nabm || !ac97_mixer) {
+        DPRINT("[ac97] NO BARS\r\n");
         fb_write("AC97: no BARs\n");
         return;
     }
@@ -109,6 +138,7 @@ void ac97_init(void)
     outw(ac97_mixer + MIX_RESET, 0);
     for (volatile int d = 0; d < 10000; d++);
     uint16_t reset_st = inw(ac97_mixer + MIX_RESET);
+    DPRINT("[ac97] mixer reset_st=0x"); dprint_hex(reset_st); DPRINT("\r\n");
     if (reset_st & 0x01) {
         fb_write("AC97 mixer ready\n");
     } else {
@@ -123,15 +153,42 @@ void ac97_init(void)
     outw(ac97_mixer + MIX_RATE, SAMPLE_RATE);
     for (volatile int d = 0; d < 1000; d++);
     uint16_t rate = inw(ac97_mixer + MIX_RATE);
+    DPRINT("[ac97] rate written, readback=0x"); dprint_hex(rate); DPRINT("\r\n");
 
     fb_write("AC97 ok\n");
 
     ac97_initialized = 1;
+    DPRINT("[ac97] initialized OK\r\n");
 }
 
 int ac97_is_init(void) {
     return ac97_initialized;
 }
+
+static int current_volume = 31;
+static int current_mute = 0;
+
+void ac97_set_volume(int level) {
+    if (!ac97_initialized) return;
+    if (level < 0) level = 0;
+    if (level > 31) level = 31;
+    current_volume = level;
+    uint16_t mute_bits = current_mute ? ((1 << 5) | (1 << 13)) : 0;
+    uint16_t val = ((level << 8) | level) | mute_bits;
+    outw(ac97_mixer + MIX_MASTER, val);
+    outw(ac97_mixer + MIX_PCM, val);
+}
+
+void ac97_set_mute(int mute) {
+    if (!ac97_initialized) return;
+    current_mute = mute;
+    uint16_t mute_bits = mute ? ((1 << 5) | (1 << 13)) : 0;
+    uint16_t val = ((current_volume << 8) | current_volume) | mute_bits;
+    outw(ac97_mixer + MIX_MASTER, val);
+}
+
+int ac97_get_volume(void) { return current_volume; }
+int ac97_get_mute(void) { return current_mute; }
 
 // ─── Play a tone via AC97 DMA ───
 
@@ -183,6 +240,70 @@ void ac97_play(uint32_t freq, uint32_t ms)
 
     // Stop
     outw(ac97_nabm + PO_CR, 0);
+}
+
+// ─── Non-blocking playback + background music (original tune) ─────────
+
+void ac97_play_nb(uint32_t freq, uint32_t ms, int amp)
+{
+    DPRINT("[ac97] play_nb f="); dprint_dec(freq); DPRINT("\r\n");
+    if (!ac97_initialized) return;
+
+    outw(ac97_nabm + PO_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+
+    int nsamples = SAMPLE_RATE * ms / 1000;
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    if (nsamples < 64) nsamples = 64;
+
+    if (freq > 0) {
+        int half_period = SAMPLE_RATE / (freq * 2);
+        if (half_period < 1) half_period = 1;
+        for (int i = 0; i < nsamples; i++) {
+            int16_t v = ((i / half_period) & 1) ? (int16_t)amp : (int16_t)(-amp);
+            sample_buf[i * 2] = v;
+            sample_buf[i * 2 + 1] = v;
+        }
+    } else {
+        for (int i = 0; i < nsamples; i++) { sample_buf[i * 2] = 0; sample_buf[i * 2 + 1] = 0; }
+    }
+
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+}
+
+int ac97_busy(void)
+{
+    if (!ac97_initialized) return 0;
+    return !(inw(ac97_nabm + PO_SR) & SR_DCH);
+}
+
+// ─── Play raw PCM samples (non-blocking, for VoIP) ───
+void ac97_play_raw(const int16_t *samples, int count)
+{
+    if (!ac97_initialized || count <= 0) return;
+    if (count > SAMPLE_COUNT) count = SAMPLE_COUNT;
+
+    outw(ac97_nabm + PO_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+
+    for (int i = 0; i < count; i++) {
+        sample_buf[i * 2] = samples[i];     // left
+        sample_buf[i * 2 + 1] = samples[i]; // right
+    }
+
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = count * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
 }
 
 // ─── Keyboard click ───
@@ -330,6 +451,54 @@ void speaker_beep(uint32_t freq, uint32_t ms)
 #define NOTE_FS6 1480
 #define NOTE_G6  1568
 
+// ─── Original chiptune for the setup wizard (100% original, no copyright) ──
+// Andamento allegro in Do maggiore. Nota 0 = pausa. Durate in millisecondi.
+
+#define MUSIC_LEN 64
+static const uint32_t music_freq[MUSIC_LEN] = {
+    NOTE_C5, NOTE_E5, NOTE_G5, NOTE_E5, NOTE_F5, NOTE_A5, NOTE_C6, NOTE_A5,
+    NOTE_G5, NOTE_E5, NOTE_G5, NOTE_E5, NOTE_D5, NOTE_F5, NOTE_A5, NOTE_F5,
+    NOTE_C5, NOTE_E5, NOTE_G5, NOTE_C6, NOTE_B5, NOTE_G5, NOTE_D5, NOTE_G5,
+    NOTE_A5, NOTE_G5, NOTE_E5, NOTE_D5, NOTE_C5, 0,      NOTE_C5, 0,
+    NOTE_C5, NOTE_E5, NOTE_G5, NOTE_E5, NOTE_F5, NOTE_A5, NOTE_C6, NOTE_A5,
+    NOTE_G5, NOTE_E5, NOTE_G5, NOTE_E5, NOTE_D5, NOTE_F5, NOTE_A5, NOTE_F5,
+    NOTE_E5, NOTE_G5, NOTE_C6, NOTE_G5, NOTE_B5, NOTE_G5, NOTE_D5, NOTE_B5,
+    NOTE_A5, NOTE_G5, NOTE_F5, NOTE_E5, NOTE_D5, NOTE_C5, 0,      0,
+};
+static const uint32_t music_ms[MUSIC_LEN] = {
+    180,180,180,180, 180,180,180,180, 180,180,180,180, 180,180,180,180,
+    180,180,180,240, 180,180,180,180, 180,180,180,180, 240,120, 240,120,
+    180,180,180,180, 180,180,180,180, 180,180,180,180, 180,180,180,180,
+    180,180,180,180, 180,180,180,180, 180,180,180,180, 180,240, 240,120,
+};
+
+static int music_on = 0;
+static int music_i = 0;
+
+void ac97_music_start(void)
+{
+    if (!ac97_initialized) return;
+    music_on = 1;
+    music_i = 0;
+    ac97_play_nb(music_freq[0], music_ms[0], 9000);
+}
+
+void ac97_music_stop(void)
+{
+    music_on = 0;
+    if (ac97_initialized) outw(ac97_nabm + PO_CR, 0);
+}
+
+// Chiamato a ogni frame: quando la nota corrente finisce, parte la prossima.
+void ac97_music_poll(void)
+{
+    if (!music_on || !ac97_initialized) return;
+    if (ac97_busy()) return;
+    music_i++;
+    if (music_i >= MUSIC_LEN) music_i = 0;
+    ac97_play_nb(music_freq[music_i], music_ms[music_i], 9000);
+}
+
 void play_startup_melody(void)
 {
     // Original "power-up" chime (no copyrighted melody)
@@ -349,6 +518,52 @@ void play_startup_melody(void)
     speaker_beep(NOTE_C6, 120);
     speaker_beep(NOTE_G5, 180);
     speaker_off();
+}
+
+// ─── Ambient background music (slow, calm loop) ───
+#define AMB_LEN 48
+static const uint32_t amb_freq[AMB_LEN] = {
+    NOTE_C4, 0, NOTE_E4, 0, NOTE_G4, 0, NOTE_C5, 0,
+    NOTE_B4, 0, NOTE_G4, 0, NOTE_E4, 0, NOTE_C4, 0,
+    NOTE_F4, 0, NOTE_A4, 0, NOTE_C5, 0, NOTE_A4, 0,
+    NOTE_G4, 0, NOTE_E4, 0, NOTE_D4, 0, NOTE_C4, 0,
+    NOTE_A3, 0, NOTE_C4, 0, NOTE_E4, 0, NOTE_A4, 0,
+    NOTE_G4, 0, NOTE_E4, 0, NOTE_C4, 0, 0, 0,
+};
+static const uint32_t amb_ms[AMB_LEN] = {
+    400,100,400,100,400,100,600,100,
+    400,100,400,100,400,100,600,100,
+    400,100,400,100,400,100,600,100,
+    400,100,400,100,400,100,600,100,
+    400,100,400,100,400,100,600,100,
+    400,100,400,100,600,100,800,400,
+};
+
+static int amb_on = 0;
+static int amb_i = 0;
+
+void ac97_ambient_start(void)
+{
+    if (!ac97_initialized) return;
+    amb_on = 1;
+    amb_i = 0;
+    ac97_play_nb(amb_freq[0], amb_ms[0], 3000);
+}
+
+void ac97_ambient_stop(void)
+{
+    amb_on = 0;
+    if (ac97_initialized) outw(ac97_nabm + PO_CR, 0);
+}
+
+void ac97_ambient_poll(void)
+{
+    if (!amb_on || !ac97_initialized) return;
+    if (ac97_busy()) return;
+    amb_i++;
+    if (amb_i >= AMB_LEN) { amb_on = 0; return; }
+    if (amb_freq[amb_i] == 0) { ac97_play_nb(0, amb_ms[amb_i], 1000); }
+    else { ac97_play_nb(amb_freq[amb_i], amb_ms[amb_i], 3000); }
 }
 
 void play_sweep(uint32_t freq_start, uint32_t freq_end, uint32_t ms)
@@ -424,6 +639,25 @@ void ac97_stop_capture(void)
     capture_active = 0;
 }
 
+// Read stereo samples from capture buffer at given offset
+void ac97_capture_read(int16_t *out, int offset, int count)
+{
+    if (!capture_active) { for (int i = 0; i < count*2; i++) out[i] = 0; return; }
+    for (int i = 0; i < count; i++) {
+        int idx = (offset + i) % SAMPLE_COUNT;
+        out[i*2]     = capture_buf[idx*2];     // left
+        out[i*2 + 1] = capture_buf[idx*2 + 1]; // right
+    }
+}
+
+// Get current DMA write position (for tracking)
+int ac97_capture_pos(void)
+{
+    if (!capture_active) return 0;
+    uint16_t pos = inw(ac97_nabm + PI_CIV);
+    return (int)pos;
+}
+
 // ─── STT capture (ring 10s, riconoscimento in-kernel) ────────────────────
 
 #define STT_CAP_SECS  5
@@ -480,10 +714,297 @@ int ac97_stt_valid_frames(void)
 
 const int16_t *ac97_stt_buffer(void) { return stt_cap_buf; }
 
+// Livello istantaneo del microfono (picco degli ultimi campioni catturati)
+int ac97_stt_level(void)
+{
+    if (!stt_cap_active) return 0;
+    int peak = 0, n = 2000;
+    if (n > STT_CAP_FRAMES * 2) n = STT_CAP_FRAMES * 2;
+    int start = stt_cap_pos / 2;           // byte -> campioni
+    if (start + n > STT_CAP_FRAMES * 2) start = STT_CAP_FRAMES * 2 - n;
+    if (start < 0) start = 0;
+    for (int i = 0; i < n; i += 2) {
+        int s = stt_cap_buf[start + i];
+        if (s < 0) s = -s;
+        if (s > peak) peak = s;
+    }
+    return peak;
+}
+
 void ac97_stt_stop(void)
 {
     if (!stt_cap_active) return;
     ac97_stt_track();
     outw(ac97_nabm + PI_CR, 0);
     stt_cap_active = 0;
+}
+
+// ─── Procedural UI sounds (generated on-the-fly, no PCM arrays) ────────
+
+// Soft dock hover tick — very short, gentle sine blip
+void ac97_play_hover(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = SAMPLE_RATE * 30 / 1000; // 30ms
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    int freq = 2400;
+    int half_period = SAMPLE_RATE / (freq * 2);
+    if (half_period < 1) half_period = 1;
+    int16_t peak = 4000;
+    for (int i = 0; i < nsamples; i++) {
+        int16_t v = ((i / half_period) & 1) ? peak : -peak;
+        int16_t env = peak - (peak * i / nsamples);
+        v = v * env / peak;
+        sample_buf[i * 2] = v;
+        sample_buf[i * 2 + 1] = v;
+    }
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    for (volatile int w = 0; w < 30000; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// Notification chime — two-tone ascending (like macOS)
+void ac97_play_notify(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = SAMPLE_RATE * 300 / 1000; // 300ms
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    int freqs[2] = {880, 1320};
+    int tones[2] = {150, 150};
+    int pos = 0;
+    for (int t = 0; t < 2; t++) {
+        int half_period = SAMPLE_RATE / (freqs[t] * 2);
+        if (half_period < 1) half_period = 1;
+        int16_t peak = 12000;
+        for (int i = 0; i < tones[t] && pos < nsamples; i++, pos++) {
+            int16_t env = peak - (peak * i / tones[t]);
+            int16_t v = ((pos / half_period) & 1) ? peak : -peak;
+            v = v * env / peak;
+            sample_buf[pos * 2] = v;
+            sample_buf[pos * 2 + 1] = v;
+        }
+    }
+    // Fill remaining with silence
+    for (; pos < nsamples; pos++) {
+        sample_buf[pos * 2] = 0;
+        sample_buf[pos * 2 + 1] = 0;
+    }
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    for (volatile int w = 0; w < 300000; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// Startup chime — 3-note ascending with fade-in/out (800ms)
+void ac97_play_startup(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = SAMPLE_RATE * 800 / 1000; // 800ms
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    int freqs[3] = {523, 659, 784}; // C5, E5, G5 major chord arpeggio
+    int note_len = nsamples / 4;
+    for (int i = 0; i < nsamples; i++) {
+        int note = i / note_len;
+        if (note > 2) note = 2;
+        int16_t v = 0;
+        for (int h = 1; h <= 3; h++) {
+            int f = freqs[note] * h;
+            int hp = SAMPLE_RATE / (f * 2);
+            if (hp < 1) hp = 1;
+            int amp = 6000 / h;
+            v += ((i / hp) & 1) ? amp : -amp;
+        }
+        // Envelope: fade in 50ms, sustain, fade out 100ms
+        int16_t env = 1000;
+        int fade_in = SAMPLE_RATE * 50 / 1000;
+        int fade_out = SAMPLE_RATE * 100 / 1000;
+        if (i < fade_in) env = 1000 * i / fade_in;
+        else if (i > nsamples - fade_out) env = 1000 * (nsamples - i) / fade_out;
+        v = v * env / 1000;
+        sample_buf[i * 2] = v;
+        sample_buf[i * 2 + 1] = v;
+    }
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    for (volatile int w = 0; w < 800000; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// Error buzz — low harsh buzz for errors
+void ac97_play_error(void)
+{
+    if (!ac97_initialized) return;
+    int nsamples = SAMPLE_RATE * 200 / 1000; // 200ms
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    int freq = 120;
+    int half_period = SAMPLE_RATE / (freq * 2);
+    if (half_period < 1) half_period = 1;
+    int16_t peak = 8000;
+    for (int i = 0; i < nsamples; i++) {
+        int16_t v = ((i / half_period) & 1) ? peak : -peak;
+        int16_t env = peak - (peak * i / nsamples);
+        v = v * env / peak;
+        sample_buf[i * 2] = v;
+        sample_buf[i * 2 + 1] = v;
+    }
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+    for (volatile int w = 0; w < 200000; w++) {
+        asm volatile("pause");
+        if (inw(ac97_nabm + PO_SR) & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// ─── DTMF dual-tone generation (Phone dial pad) ─────────────────────
+
+void ac97_play_dtmf(char digit, uint32_t ms)
+{
+    if (!ac97_initialized) return;
+
+    // DTMF frequency table: rows (low group) and columns (high group)
+    //        1209Hz  1336Hz  1477Hz  1633Hz
+    // 697Hz:   1       2       3       A
+    // 770Hz:   4       5       6       B
+    // 852Hz:   7       8       9       C
+    // 941Hz:   *       0       #       D
+    static const int dtmf_rows[] = {697, 770, 852, 941};
+    static const int dtmf_cols[] = {1209, 1336, 1477, 1633};
+    // Map digit to (row, col) index
+    static const int dtmf_map[][2] = {
+        {3,1}, // 0
+        {0,0}, // 1
+        {0,1}, // 2
+        {0,2}, // 3
+        {1,0}, // 4
+        {1,1}, // 5
+        {1,2}, // 6
+        {2,0}, // 7
+        {2,1}, // 8
+        {2,2}, // 9
+        {3,0}, // *
+        {3,2}, // #
+    };
+
+    int idx = -1;
+    if (digit >= '0' && digit <= '9') idx = digit - '0';
+    else if (digit == '*') idx = 10;
+    else if (digit == '#') idx = 11;
+    if (idx < 0) return;
+
+    int row_freq = dtmf_rows[dtmf_map[idx][0]];
+    int col_freq = dtmf_cols[dtmf_map[idx][1]];
+
+    outw(ac97_nabm + PO_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+
+    int nsamples = SAMPLE_RATE * ms / 1000;
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    if (nsamples < 64) nsamples = 64;
+
+    // Generate dual-tone: sum of two sine waves
+    // Using integer approximation of sine (parabolic)
+    for (int i = 0; i < nsamples; i++) {
+        float t = (float)i / (float)SAMPLE_RATE;
+        // Row tone + column tone, mixed at half amplitude each
+        float row_sin = k_cosf(2.0f * 3.14159f * row_freq * t - 1.5708f); // sin via cos(pi/2 shift)
+        float col_sin = k_cosf(2.0f * 3.14159f * col_freq * t - 1.5708f);
+        float mixed = (row_sin + col_sin) * 0.35f; // scale to avoid clipping
+        int16_t v = (int16_t)(mixed * 16000.0f);
+        sample_buf[i * 2] = v;
+        sample_buf[i * 2 + 1] = v;
+    }
+
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 1000; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    for (volatile int d = 0; d < 1000; d++);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
+
+    // Wait for duration
+    for (volatile uint32_t w = 0; w < ms * 20000; w++) {
+        asm volatile("pause");
+        uint16_t sr = inw(ac97_nabm + PO_SR);
+        if (sr & SR_DCH) break;
+    }
+    outw(ac97_nabm + PO_CR, 0);
+}
+
+// ─── DTMF dual-tone non-blocking (for ambient phone ring) ───
+void ac97_play_dtmf_nb(char digit)
+{
+    if (!ac97_initialized) return;
+
+    static const int dtmf_rows[] = {697, 770, 852, 941};
+    static const int dtmf_cols[] = {1209, 1336, 1477, 1633};
+    static const int dtmf_map[][2] = {
+        {3,1},{0,0},{0,1},{0,2},{1,0},{1,1},{1,2},{2,0},{2,1},{2,2},{3,0},{3,2}
+    };
+
+    int idx = -1;
+    if (digit >= '0' && digit <= '9') idx = digit - '0';
+    else if (digit == '*') idx = 10;
+    else if (digit == '#') idx = 11;
+    if (idx < 0) return;
+
+    int row_freq = dtmf_rows[dtmf_map[idx][0]];
+    int col_freq = dtmf_cols[dtmf_map[idx][1]];
+
+    outw(ac97_nabm + PO_CR, CR_RR);
+    for (volatile int d = 0; d < 1000; d++);
+
+    int nsamples = SAMPLE_RATE * 200 / 1000; // 200ms
+    if (nsamples > SAMPLE_COUNT) nsamples = SAMPLE_COUNT;
+    if (nsamples < 64) nsamples = 64;
+
+    for (int i = 0; i < nsamples; i++) {
+        float t = (float)i / (float)SAMPLE_RATE;
+        float row_sin = k_cosf(2.0f * 3.14159f * row_freq * t - 1.5708f);
+        float col_sin = k_cosf(2.0f * 3.14159f * col_freq * t - 1.5708f);
+        float mixed = (row_sin + col_sin) * 0.35f;
+        int16_t v = (int16_t)(mixed * 16000.0f);
+        sample_buf[i * 2] = v;
+        sample_buf[i * 2 + 1] = v;
+    }
+
+    bd_list[0].pointer = (uint32_t)(uintptr_t)sample_buf;
+    bd_list[0].length = nsamples * 4;
+    bd_list[0].flags = BD_IOC | BD_BUP;
+    outl(ac97_nabm + PO_BDBAR, (uint32_t)(uintptr_t)bd_list);
+    for (volatile int d = 0; d < 500; d++);
+    outw(ac97_nabm + PO_LVI, 0);
+    outw(ac97_nabm + PO_CR, CR_RPBM);
 }

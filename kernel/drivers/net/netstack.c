@@ -19,6 +19,7 @@ extern uint8_t nic_mac[6];
 extern int nic_ready;
 int rtl8139_send(const void*,int);
 int rtl8139_poll(void);
+void net_poll_all(void);
 
 // ─── hton helpers ───
 static uint16_t htons(uint16_t x) { return __builtin_bswap16(x); }
@@ -93,22 +94,23 @@ static void arp_send_request(uint32_t ip) {
     arp->plen = 4;
     arp->oper = htons(ARP_REQUEST);
     memcpy(arp->sha, nic_mac, 6);
-    arp->sip = OUR_IP;
+    arp->sip = htonl(OUR_IP);
     memset(arp->tha, 0, 6);
-    arp->tip = ip;
+    arp->tip = htonl(ip);
     rtl8139_send(buf, sizeof(buf));
 }
 
 static void arp_handle(arp_pkt_t *arp) {
-    if (ntohs(arp->oper) == ARP_REPLY && arp->tip == OUR_IP) {
-        arp_cache_add(arp->sip, arp->sha);
-        if (arp_waiting && arp->sip == arp_wait_ip) {
+    if (ntohs(arp->oper) == ARP_REPLY && ntohl(arp->tip) == OUR_IP) {
+        uint32_t sip = ntohl(arp->sip);
+        arp_cache_add(sip, arp->sha);
+        if (arp_waiting && sip == arp_wait_ip) {
             memcpy(arp_wait_mac, arp->sha, 6);
             arp_wait_ok = 1;
             arp_waiting = 0;
         }
     }
-    if (ntohs(arp->oper) == ARP_REQUEST && arp->tip == OUR_IP) {
+    if (ntohs(arp->oper) == ARP_REQUEST && ntohl(arp->tip) == OUR_IP) {
         uint8_t reply[sizeof(eth_hdr_t)+sizeof(arp_pkt_t)];
         eth_hdr_t *e = (eth_hdr_t*)reply;
         arp_pkt_t *a = (arp_pkt_t*)(reply+sizeof(eth_hdr_t));
@@ -121,9 +123,9 @@ static void arp_handle(arp_pkt_t *arp) {
         a->plen = 4;
         a->oper = htons(ARP_REPLY);
         memcpy(a->sha, nic_mac, 6);
-        a->sip = OUR_IP;
+        a->sip = htonl(OUR_IP);
         memcpy(a->tha, arp->sha, 6);
-        a->tip = arp->sip;
+        a->tip = htonl(ntohl(arp->sip));
         rtl8139_send(reply, sizeof(reply));
     }
 }
@@ -135,15 +137,10 @@ static int arp_resolve(uint32_t ip, uint8_t *mac) {
     arp_wait_ip = ip;
     arp_wait_ok = 0;
     arp_send_request(ip);
-    for (int w = 0; w < 50000; w++) {
-        // Poll for ARP reply
-        int plen = rtl8139_poll();
-        if (plen > 0) {
-            // Re-parse from rx_ring (we just signal length with poll)
-            // Actually rtl8139_poll already updated CAPR, so we need the data
-            // For simplicity, we re-send request periodically
-        }
+    for (int w = 0; w < 30000; w++) {
+        net_poll_all();
         if (arp_wait_ok) {
+            arp_waiting = 0;
             memcpy(mac, arp_wait_mac, 6);
             return 1;
         }
@@ -168,14 +165,132 @@ typedef struct __attribute__((packed)) {
     uint32_t dst_ip;
 } ip_hdr_t;
 #define IP_PROTO_TCP 6
+#define IP_PROTO_UDP 17
 
 static uint16_t ip_cksum(void *hdr, int len) {
     uint32_t sum = 0;
-    uint16_t *p = (uint16_t*)hdr;
-    for (int i = 0; i < len/2; i++) sum += p[i];
+    uint8_t *b = (uint8_t*)hdr;
+    for (int i = 0; i + 1 < len; i += 2) sum += (uint16_t)((b[i] << 8) | b[i+1]);
+    if (len & 1) sum += (uint16_t)(b[len-1] << 8);
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
     return ~(uint16_t)sum;
 }
+
+// ─── UDP ───
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t length;
+    uint16_t cksum;
+} udp_hdr_t;
+
+// UDP receive buffer (single packet, simple)
+static uint8_t udp_rx_buf[1500];
+static int udp_rx_len = 0;
+static uint16_t udp_rx_src_port = 0;
+static uint32_t udp_rx_src_ip = 0;
+static int udp_rx_ready = 0;
+
+// UDP callback for VoIP (set by phone app)
+static void (*udp_rx_callback)(uint32_t src_ip, uint16_t src_port, const uint8_t *data, int len) = 0;
+
+void udp_set_callback(void (*cb)(uint32_t, uint16_t, const uint8_t*, int)) {
+    udp_rx_callback = cb;
+}
+
+// Send UDP packet (raw, no connection)
+int udp_send(uint32_t dst_ip, uint16_t dst_port, uint16_t src_port, const uint8_t *data, int data_len) {
+    if (!nic_ready) return -1;
+
+    // Resolve MAC
+    uint32_t nh = dst_ip;
+    if ((dst_ip & 0xFFFFFF00) != (OUR_IP & 0xFFFFFF00))
+        nh = GATEWAY_IP;
+    uint8_t mac[6];
+    if (!arp_resolve(nh, mac)) return -1;
+
+    uint8_t buf[sizeof(eth_hdr_t) + sizeof(ip_hdr_t) + sizeof(udp_hdr_t) + 1472];
+    eth_hdr_t *eth = (eth_hdr_t*)buf;
+    ip_hdr_t *ip = (ip_hdr_t*)(buf + sizeof(eth_hdr_t));
+    udp_hdr_t *udp = (udp_hdr_t*)(buf + sizeof(eth_hdr_t) + sizeof(ip_hdr_t));
+    int udp_len = sizeof(udp_hdr_t) + data_len;
+    int ip_len = sizeof(ip_hdr_t) + udp_len;
+
+    // Ethernet
+    memcpy(eth->dst, mac, 6);
+    memcpy(eth->src, nic_mac, 6);
+    eth->type = htons(ETH_IP);
+
+    // IP
+    ip->ver_ihl = 0x45;
+    ip->dscp = 0;
+    ip->total_len = htons(ip_len);
+    ip->id = 0;
+    ip->flags_frag = 0;
+    ip->ttl = 64;
+    ip->protocol = IP_PROTO_UDP;
+    ip->cksum = 0;
+    ip->src_ip = htonl(OUR_IP);
+    ip->dst_ip = htonl(dst_ip);
+    ip->cksum = htons(ip_cksum(ip, sizeof(ip_hdr_t)));
+
+    // UDP
+    udp->src_port = htons(src_port);
+    udp->dst_port = htons(dst_port);
+    udp->length = htons(udp_len);
+    udp->cksum = 0; // optional for IPv4
+
+    // Payload
+    if (data && data_len > 0) {
+        uint8_t *payload = buf + sizeof(eth_hdr_t) + sizeof(ip_hdr_t) + sizeof(udp_hdr_t);
+        for (int i = 0; i < data_len; i++) payload[i] = data[i];
+    }
+
+    rtl8139_send(buf, sizeof(eth_hdr_t) + ip_len);
+    return data_len;
+}
+
+// Handle incoming UDP packet
+static void udp_handle(ip_hdr_t *ip, int ip_hdr_len, int total_len) {
+    int udp_len = total_len - ip_hdr_len;
+    if (udp_len < sizeof(udp_hdr_t)) return;
+
+    udp_hdr_t *udp = (udp_hdr_t*)((uint8_t*)ip + ip_hdr_len);
+    uint8_t *data = (uint8_t*)udp + sizeof(udp_hdr_t);
+    int data_len = udp_len - sizeof(udp_hdr_t);
+
+    uint16_t dst_port = ntohs(udp->dst_port);
+    uint16_t src_port = ntohs(udp->src_port);
+    uint32_t src_ip = ntohl(ip->src_ip);
+
+    // Copy to receive buffer
+    if (data_len > 1500) data_len = 1500;
+    for (int i = 0; i < data_len; i++) udp_rx_buf[i] = data[i];
+    udp_rx_len = data_len;
+    udp_rx_src_port = src_port;
+    udp_rx_src_ip = src_ip;
+    udp_rx_ready = 1;
+
+    // Call VoIP callback if registered
+    if (udp_rx_callback) {
+        udp_rx_callback(src_ip, src_port, data, data_len);
+    }
+}
+
+// Non-blocking UDP receive (returns 1 if packet available, copies data)
+int udp_recv(uint8_t *buf, int max_len, uint32_t *src_ip, uint16_t *src_port) {
+    if (!udp_rx_ready) return 0;
+    int n = udp_rx_len;
+    if (n > max_len) n = max_len;
+    for (int i = 0; i < n; i++) buf[i] = udp_rx_buf[i];
+    if (src_ip) *src_ip = udp_rx_src_ip;
+    if (src_port) *src_port = udp_rx_src_port;
+    udp_rx_ready = 0;
+    return n;
+}
+
+// Get our IP address
+uint32_t net_get_ip(void) { return OUR_IP; }
 
 // ─── TCP ───
 typedef struct __attribute__((packed)) {
@@ -212,9 +327,9 @@ static struct {
     uint16_t src_port, dst_port;
     uint32_t rem_ip;
     uint8_t  rem_mac[6];
-    uint8_t  rx_buf[1460];
-    int      rx_len;
-    int      rx_done;
+    uint8_t  stream[32768];
+    int      stream_head;
+    int      stream_len;
 } tcp_conn;
 
 static uint16_t tcp_cksum(ip_hdr_t *ip, tcp_hdr_t *tcp, int tcp_len) {
@@ -225,10 +340,11 @@ static uint16_t tcp_cksum(ip_hdr_t *ip, tcp_hdr_t *tcp, int tcp_len) {
     ps.zero = 0;
     ps.proto = IP_PROTO_TCP;
     ps.tcp_len = htons(tcp_len);
-    uint16_t *p = (uint16_t*)&ps;
-    for (int i = 0; i < 6; i++) sum += p[i];
-    uint16_t *t = (uint16_t*)tcp;
-    for (int i = 0; i < tcp_len/2; i++) sum += t[i];
+    uint8_t *pb = (uint8_t*)&ps;
+    for (int i = 0; i < 12; i += 2) sum += (uint16_t)((pb[i] << 8) | pb[i+1]);
+    uint8_t *t = (uint8_t*)tcp;
+    for (int i = 0; i + 1 < tcp_len; i += 2) sum += (uint16_t)((t[i] << 8) | t[i+1]);
+    if (tcp_len & 1) sum += (uint16_t)(t[tcp_len-1] << 8);
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
     return ~(uint16_t)sum;
 }
@@ -255,9 +371,9 @@ static int tcp_build_packet(uint8_t *buf, uint32_t rem_ip, const uint8_t *rem_ma
     ip->ttl = 64;
     ip->protocol = IP_PROTO_TCP;
     ip->cksum = 0;
-    ip->src_ip = OUR_IP;
-    ip->dst_ip = rem_ip;
-    ip->cksum = ip_cksum(ip, sizeof(ip_hdr_t));
+    ip->src_ip = htonl(OUR_IP);
+    ip->dst_ip = htonl(rem_ip);
+    ip->cksum = htons(ip_cksum(ip, sizeof(ip_hdr_t)));
 
     tcp->src_port = htons(src_port);
     tcp->dst_port = htons(dst_port);
@@ -273,7 +389,7 @@ static int tcp_build_packet(uint8_t *buf, uint32_t rem_ip, const uint8_t *rem_ma
         for (int i = 0; i < data_len; i++)
             buf[sizeof(eth_hdr_t)+sizeof(ip_hdr_t)+sizeof(tcp_hdr_t)+i] = data[i];
 
-    tcp->cksum = tcp_cksum(ip, tcp, tcp_len);
+    tcp->cksum = htons(tcp_cksum(ip, tcp, tcp_len));
 
     return sizeof(eth_hdr_t) + ip_len;
 }
@@ -314,11 +430,11 @@ static void tcp_handle(tcp_hdr_t *tcp, int tcp_len, uint32_t src_ip) {
         if (data_len > 0) {
             tcp_conn.rem_seq = seq + data_len;
             tcp_conn.my_ack = ack;
-            // Copy data to rx buffer
-            for (int i = 0; i < data_len && i < 1460; i++)
-                tcp_conn.rx_buf[i] = data[i];
-            tcp_conn.rx_len = data_len;
-            tcp_conn.rx_done = 1;
+            // Accumula nel stream buffer (supporta risposte grandi, multi-pacchetto)
+            for (int i = 0; i < data_len; i++) {
+                if (tcp_conn.stream_len < 32768)
+                    tcp_conn.stream[tcp_conn.stream_len++] = data[i];
+            }
             // Send ACK
             uint8_t buf[sizeof(eth_hdr_t)+sizeof(ip_hdr_t)+sizeof(tcp_hdr_t)];
             int len = tcp_build_packet(buf, tcp_conn.rem_ip, tcp_conn.rem_mac,
@@ -345,8 +461,13 @@ int tcp_connect(uint32_t ip, uint16_t port) {
     if (!nic_ready) return -1;
     fb_write("NET: TCP connect\n");
 
-    // Resolve MAC via ARP
-    if (!arp_resolve(ip, tcp_conn.rem_mac)) {
+    // Resolve MAC via ARP. For hosts outside our /24 subnet, ARP the
+    // default gateway (QEMU slirp answers for 10.0.2.2) and use its MAC
+    // as the L2 destination for the packet.
+    uint32_t nh = ip;
+    if ((ip & 0xFFFFFF00) != (OUR_IP & 0xFFFFFF00))
+        nh = GATEWAY_IP;
+    if (!arp_resolve(nh, tcp_conn.rem_mac)) {
         fb_write("NET: ARP failed\n");
         return -1;
     }
@@ -357,8 +478,8 @@ int tcp_connect(uint32_t ip, uint16_t port) {
     tcp_conn.rem_ip = ip;
     tcp_conn.dst_port = port;
     tcp_conn.src_port = 40000;
-    tcp_conn.rx_len = 0;
-    tcp_conn.rx_done = 0;
+    tcp_conn.stream_head = 0;
+    tcp_conn.stream_len = 0;
 
     uint8_t buf[sizeof(eth_hdr_t)+sizeof(ip_hdr_t)+sizeof(tcp_hdr_t)];
     int len = tcp_build_packet(buf, ip, tcp_conn.rem_mac,
@@ -369,13 +490,7 @@ int tcp_connect(uint32_t ip, uint16_t port) {
 
     // Wait for SYN+ACK
     for (int w = 0; w < 100000; w++) {
-        int plen = rtl8139_poll();
-        if (plen > 0) {
-            uint8_t pkt_buf[1800];
-            // Re-read from rx_ring
-            // Actually rtl8139_poll just returns length and updates CAPR
-            // We need to read from the RX ring buffer
-        }
+        net_poll_all();
         if (tcp_conn.state == TCP_ESTAB) {
             fb_write("NET: TCP established\n");
             return 0;
@@ -429,6 +544,13 @@ void net_poll_all(void) {
                 tcp_handle(tcp, tcp_len, ip->src_ip);
             }
         }
+        if (ip->protocol == IP_PROTO_UDP) {
+            int ip_hdr_len = (ip->ver_ihl & 0xF) * 4;
+            int total_len = ntohs(ip->total_len);
+            if (buf + sizeof(eth_hdr_t) + total_len <= buf + plen) {
+                udp_handle(ip, ip_hdr_len, total_len);
+            }
+        }
     }
 }
 
@@ -436,12 +558,12 @@ void net_poll_all(void) {
 int tcp_poll(uint8_t *buf, int max_len) {
     // First process any pending packets
     net_poll_all();
-    if (tcp_conn.rx_done) {
-        int n = tcp_conn.rx_len;
+    int avail = tcp_conn.stream_len - tcp_conn.stream_head;
+    if (avail > 0) {
+        int n = avail;
         if (n > max_len) n = max_len;
-        for (int i = 0; i < n; i++) buf[i] = tcp_conn.rx_buf[i];
-        tcp_conn.rx_done = 0;
-        tcp_conn.rx_len = 0;
+        for (int i = 0; i < n; i++) buf[i] = tcp_conn.stream[tcp_conn.stream_head + i];
+        tcp_conn.stream_head += n;
         return n;
     }
     return 0;
@@ -449,7 +571,7 @@ int tcp_poll(uint8_t *buf, int max_len) {
 
 int tcp_has_data(void) {
     net_poll_all();
-    return tcp_conn.rx_done;
+    return (tcp_conn.stream_len - tcp_conn.stream_head) > 0;
 }
 
 // ─── SMTP Client ───
